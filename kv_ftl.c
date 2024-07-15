@@ -978,8 +978,11 @@ bool kv_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req, struct 
 		ret->nsecs_target = __schedule_flush(req);
 		break;
 	case nvme_cmd_kv_store:
+	/*case nvme_cmd_kv_delete:
+		ret->nsecs_target = __schedule_flush(req);*/
 	case nvme_cmd_kv_retrieve:
 	case nvme_cmd_kv_batch:
+	case nvme_cmd_kv_exist:
 		ret->nsecs_target = __schedule_io_units(
 			cmd->common.opcode, 0, cmd_value_length(*((struct nvme_kv_command *)cmd)),
 			__get_wallclock());
