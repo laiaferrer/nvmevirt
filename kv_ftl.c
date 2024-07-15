@@ -3,9 +3,24 @@
 #include <linux/ktime.h>
 #include <linux/highmem.h>
 #include <linux/sched/clock.h>
+#include <linux/fs.h>
 
 #include "nvmev.h"
 #include "kv_ftl.h"
+
+struct file *file_open(const char *path, int flags, int rights)
+{
+    struct file *filp = NULL;
+    mm_segment_t oldfs;
+    int err = 0;
+
+    filp = filp_open(path, flags, rights);
+    if (IS_ERR(filp)) {
+        err = PTR_ERR(filp);
+        return NULL;
+    }
+    return filp;
+}
 
 static const struct allocator_ops append_only_ops = {
 	.init = append_only_allocator_init,
@@ -168,7 +183,7 @@ static unsigned int find_next_slot(struct kv_ftl *kv_ftl, int original_slot, int
 	// 1. Find the tail of the link.
 	unsigned int tail = original_slot;
 	unsigned int prevs = -1;
-	while (kv_ftl->kv_mapping_table[tail].mem_offset != -1) {	
+	while (kv_ftl->kv_mapping_table[tail].mem_offset != -1) {
 		prevs = tail;
 		tail = kv_ftl->kv_mapping_table[tail].next_slot;
 		if (tail == -1) break;
@@ -491,6 +506,9 @@ static struct mapping_entry delete_mapping_entry(struct kv_ftl *kv_ftl, struct n
 	return mapping;
 }
 
+/* 4 is for '/kv/', 16 is for the key and + 1 for the trailing 0 */
+#define KV_PATH_LEN (4+16+1)
+
 /* KV-SSD IO */
 
 /*
@@ -506,6 +524,7 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 				       unsigned int *status)
 {
 	size_t offset;
+	loff_t file_offset = 0;
 	size_t length, remaining;
 	int prp_offs = 0;
 	int prp2_offs = 0;
@@ -515,12 +534,20 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 	size_t new_offset = 0;
 	struct mapping_entry entry;
 	int is_insert = 0;
+	int ret = 0;
+	struct file *kv_file;
+	char kv_path[KV_PATH_LEN];
+	memset(kv_path, 0, KV_PATH_LEN);
+	sprintf(kv_path, "/kv/");
 
 	entry = get_mapping_entry(kv_ftl, cmd);
 	offset = entry.mem_offset;
 	length = cmd_value_length(cmd);
 
 	if (cmd.common.opcode == nvme_cmd_kv_store) {
+		strncpy(kv_path + 4, cmd.kv_store.key, KV_PATH_LEN - 4 - 1 /* always have trailing 0 */);
+		kv_file = filp_open(kv_path, O_RDWR | O_CREAT, 0666);
+
 		if (entry.mem_offset == -1) { // entry doesn't exist -> is insert
 			new_offset = allocate_mem_offset(kv_ftl, cmd);
 			offset = new_offset;
@@ -612,6 +639,16 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 		}
 		if (cmd.common.opcode == nvme_cmd_kv_store) {
 			memcpy(nvmev_vdev->storage_mapped + offset, vaddr + mem_offs, io_size);
+			if (!kv_file) {
+				NVMEV_ERROR("Could not open test_file\n");
+			} else {
+				NVMEV_INFO("Writing value: %s with size: %zu to file: %s\n", (char*)(vaddr + mem_offs), io_size, kv_path);
+				ret = kernel_write(kv_file, vaddr + mem_offs, io_size, &file_offset);
+				if (ret < 0) {
+					NVMEV_ERROR("Could not write KV to file\n");
+				}
+				filp_close(kv_file, NULL);
+			}
 		} else if (cmd.common.opcode == nvme_cmd_kv_retrieve) {
 			memcpy(vaddr + mem_offs, nvmev_vdev->storage_mapped + offset, io_size);
 		} else {
@@ -622,6 +659,7 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 
 		remaining -= io_size;
 		offset += io_size;
+		file_offset += io_size;
 	}
 
 	if (paddr_list != NULL)
