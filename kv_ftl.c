@@ -647,7 +647,7 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 	u64 *paddr_list = NULL;
 	size_t mem_offs = 0;
 	size_t new_offset = 0;
-	struct mapping_entry entry;
+
 	int is_insert = 0;
 	int ret = 0;
 	struct file *kv_file = NULL;
@@ -658,8 +658,6 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 	memset(kv_path, 0, KV_PATH_LEN);
 	sprintf(kv_path, KV_BASE_PATH);
 
-	entry = get_mapping_entry(kv_ftl, cmd);
-	offset = entry.mem_offset;
 	length = cmd_value_length(cmd);
 
 	ret = base64_encode(cmd.kv_common.key, cmd.kv_common.key_len, path_key_ptr);
@@ -673,18 +671,11 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 	NVMEV_INFO("Key: %s Key Base64: %s length: %d\n", cmd.kv_common.key, path_key_ptr, ret);
 
 	if (cmd.common.opcode == nvme_cmd_kv_store) {
-		kv_file = filp_open(kv_path, O_RDWR | O_CREAT, 0666);
-		if (entry.mem_offset == -1) { // entry doesn't exist -> is insert
-			new_offset = allocate_mem_offset(kv_ftl, cmd);
-			offset = new_offset;
-			is_insert = 1; // is insert
-
-			NVMEV_DEBUG("kv_store insert %s %lu\n", cmd.kv_store.key, offset);
-		} else {
-			NVMEV_DEBUG("kv_store update %s %lu\n", cmd.kv_store.key, offset);
-#if 0 /* OFFSETS ARE NOT ALWAYS SET */
+		if (!file_exists(kv_path)) { // entry doesn't exist -> is insert
 			if (cmd.kv_store.option & 0x01) {
 				NVMEV_DEBUG("NO kv_store insert %s %lu because Bit 8 set to 1\n", cmd.kv_store.key, offset);		//controller shall not store the value if the key does not exist
+				*status = KV_ERR_KEY_NOT_EXIST;
+				return 0;		// dev_status_code for KVS_ERR_KEY_NOT_EXIST
 			}
 			else {
 				kv_file = filp_open(kv_path, O_RDWR | O_CREAT, 0666);
@@ -694,45 +685,24 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 				NVMEV_DEBUG("kv_store insert %s %lu\n", cmd.kv_store.key, offset);
 			}
 		} else {
+			//update
 			if (cmd.kv_store.option & 0x02) {
 				NVMEV_DEBUG("NO kv_store update %s %lu because Bit 9 set to 1\n", cmd.kv_store.key, offset);		//controller shall not store the value if the key does exist
+				*status = KV_ERR_KEY_NOT_EXIST;
+				return 0;		// dev_status_code for KVS_ERR_KEY_NOT_EXIST
 			}
 			else {
-				if (entry.mem_offset == -1) { // kv pair doesn't exist
-					NVMEV_DEBUG("kv_delete %s no exist\n", cmd.kv_store.key);
-
-					*status = KV_ERR_KEY_NOT_EXIST;
-					return 0; // dev_status_code for KVS_ERR_KEY_NOT_EXIST
-				} else {
-					NVMEV_DEBUG("kv_delete %s exist - length %ld, offset %lu\n",
+				NVMEV_DEBUG("kv_delete %s exist - length %ld, offset %lu\n",
 							cmd.kv_store.key, length, offset);
+				delete_file(kv_path);
 
-					delete_file(kv_path);
-					delete_mapping_entry(kv_ftl, cmd);
-				}
-
-				//store of the KV
-				if (cmd.kv_store.option & 0x01) {
-					NVMEV_DEBUG("NO kv_store insert %s %lu because Bit 8 set to 1\n", cmd.kv_store.key, offset);		//controller shall not store the value if the key does not exist
-				}
-				else {
-					kv_file = filp_open(kv_path, O_RDWR | O_CREAT, 0666);
-					new_offset = allocate_mem_offset(kv_ftl, cmd);
-					offset = new_offset;
-					is_insert = 1; // is insert
-					NVMEV_DEBUG("kv_store insert %s %lu\n", cmd.kv_store.key, offset);
-				}
+				//create and insert file
+				kv_file = filp_open(kv_path, O_RDWR | O_CREAT, 0666);
+				new_offset = allocate_mem_offset(kv_ftl, cmd);
+				offset = new_offset;
+				is_insert = 1; // is insert
 
 				NVMEV_DEBUG("kv_store update %s %lu\n", cmd.kv_store.key, offset);
-			}
-
-#endif
-			if (length != entry.length) {
-				if (length <= SMALL_LENGTH && entry.length <= SMALL_LENGTH) {
-					is_insert = 2; // is update with different length;
-				} else {
-					NVMEV_ERROR("Length size invalid!!");
-				}
 			}
 		}
 	} else if (cmd.common.opcode == nvme_cmd_kv_retrieve) {
@@ -740,81 +710,38 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 		if (IS_ERR(kv_file)) {
 			NVMEV_INFO("File %s does not exist\n", kv_path);
 			*status = KV_ERR_KEY_NOT_EXIST;
-			/*return 0; // dev_status_code for KVS_ERR_KEY_NOT_EXIST */
+			return 0;		// dev_status_code for KVS_ERR_KEY_NOT_EXIST
 		}
-
-		if (entry.mem_offset == -1) { // kv pair doesn't exist
-			NVMEV_DEBUG("kv_retrieve %s no exist\n", cmd.kv_store.key);
-
-			*status = KV_ERR_KEY_NOT_EXIST;
-			return 0; // dev_status_code for KVS_ERR_KEY_NOT_EXIST
-		} else {
-			length = min(entry.length, length);
-
+		else {
 			NVMEV_DEBUG("kv_retrieve %s exist - length %ld, offset %lu\n",
 					cmd.kv_store.key, length, offset);
 		}
 	} else if (cmd.common.opcode == nvme_cmd_kv_exist) {
 		if (!file_exists(kv_path)) {
 			NVMEV_INFO("Could not open file %s\n", kv_path);
+			*status = KV_ERR_KEY_NOT_EXIST;
+			return 0;		// dev_status_code for KVS_ERR_KEY_NOT_EXIST
 		} else {
 			NVMEV_INFO("File %s does exist\n", kv_path);
-		}
-
-		if (entry.mem_offset == -1) { // kv pair doesn't exist
-			NVMEV_DEBUG("kv_exist %s no exist\n", cmd.kv_store.key);
-
-			*status = KV_ERR_KEY_NOT_EXIST;
-			return 0; // dev_status_code for KVS_ERR_KEY_NOT_EXIST
-		} else {
-			NVMEV_DEBUG("kv_exist %s exist\n", cmd.kv_store.key);
-
-			return 0;
+			return 0; // success
 		}
 	} else if (cmd.common.opcode == nvme_cmd_kv_delete) {
 		if (!file_exists(kv_path)) {
 			NVMEV_INFO("Could not open file %s\n", kv_path);
 			*status = KV_ERR_KEY_NOT_EXIST;
-			/* return 0; */
+			return 0;		// dev_status_code for KVS_ERR_KEY_NOT_EXIST
 		} else {
 			NVMEV_INFO("File %s does exist, deleting...\n", kv_path);
 			delete_file(kv_path);
-			/* return 0; */
-		}
-#if 0
-		strncpy(kv_path + 4, key64, length_keyb64 - 4 - 1 /* always have trailing 0 */);
-		kv_file = filp_open(kv_path, O_RDONLY, 0666);
-
-		if (IS_ERR(kv_file)) {
-			NVMEV_INFO("Could not open file %s\n", kv_path);
-			*status = KV_ERR_KEY_NOT_EXIST;
-			return 0;
-		} else {
-			parent_inode = kv_file->f_path.dentry->d_parent->d_inode;
-			NVMEV_INFO("Deleting file %s\n", kv_path);
-			inode_lock(parent_inode);
-			vfs_unlink(parent_inode, kv_file->f_path.dentry, NULL);
-			inode_unlock(parent_inode);
-		}
-#endif
-		if (entry.mem_offset == -1) { // kv pair doesn't exist
-			NVMEV_DEBUG("kv_delete %s no exist\n", cmd.kv_store.key);
-
-			*status = KV_ERR_KEY_NOT_EXIST;
-			return 0; // dev_status_code for KVS_ERR_KEY_NOT_EXIST
-		} else {
-			NVMEV_DEBUG("kv_delete %s exist - length %ld, offset %lu\n",
-					cmd.kv_store.key, length, offset);
-
-			delete_mapping_entry(kv_ftl, cmd);
-			return 0;
+			return 0; // success
 		}
 	} else {
 		NVMEV_ERROR("Cmd type %d, for key %s but not store or retrieve. return 0\n",
 			    cmd.common.opcode, cmd.kv_store.key);
-
+		/*TO DO: program an error bc 0 is success*/
 		return 0;
 	}
+
 	remaining = length;
 
 	while (remaining) {
@@ -846,7 +773,6 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 				io_size = PAGE_SIZE - mem_offs;
 		}
 		if (cmd.common.opcode == nvme_cmd_kv_store) {
-			memcpy(nvmev_vdev->storage_mapped + offset, vaddr + mem_offs, io_size);
 			if (!kv_file || IS_ERR(kv_file)) {
 				NVMEV_ERROR("Could not write to file %s\n", kv_path);
 			} else {
@@ -857,7 +783,6 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 				}
 			}
 		} else if (cmd.common.opcode == nvme_cmd_kv_retrieve) {
-			memcpy(vaddr + mem_offs, nvmev_vdev->storage_mapped + offset, io_size);
 			if (!kv_file || IS_ERR(kv_file)) {
 				NVMEV_ERROR("Could not read file %s\n", kv_path);
 			} else {
@@ -884,12 +809,6 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 
 	if (paddr_list != NULL)
 		kunmap_atomic(paddr_list);
-
-	if (is_insert == 1) { // need to make new mapping
-		new_mapping_entry(kv_ftl, cmd, new_offset);
-	} else if (is_insert == 2) {
-		update_mapping_entry(kv_ftl, cmd);
-	}
 
 	if (cmd.common.opcode == nvme_cmd_kv_retrieve)
 		return length;
@@ -970,7 +889,8 @@ static unsigned int __do_perform_kv_batch(struct kv_ftl *kv_ftl, struct nvme_kv_
 	value = kmalloc(4097, GFP_KERNEL);
 	buffer = kmalloc(length, GFP_KERNEL);
 
-	//printk("kv_batch %d %d", sub_cmd_cnt, length);
+	NVMEV_ERROR("kv_batch %d %zu REMOVED\n", sub_cmd_cnt, length);
+	return 0;
 
 	remaining = length;
 	offset = 0;
@@ -1110,7 +1030,7 @@ static unsigned int kv_iter_read(struct kv_ftl *kv_ftl, struct nvme_kv_command c
 	u64 paddr;
 	u64 *paddr_list = NULL;
 
-	if (handle == NULL) {
+	if (1 || handle == NULL) {
 		NVMEV_ERROR("Invalid Iterator Handle");
 		return 0;
 	}
