@@ -19,6 +19,30 @@ union nvme_data_ptr {
 };
 
 /*KV-SSD Command*/
+struct nvme_kv_common_command {
+	__u8 opcode;
+	__u8 flags;
+	__u16 command_id;
+	__le32 nsid;
+	__u64 rsvd;
+	__le32 offset;
+	__u32 rsvd2;
+	union nvme_data_ptr dptr; /* value dptr prp1,2 */
+	__le32 value_len; /* size in word */
+	__u8 key_len; /* 0 ~ 255 (keylen - 1) */
+	__u8 option;
+	__u16 rsvd3;
+	union {
+		struct {
+			char key[16];
+		};
+		struct {
+			__le64 key_prp;
+			__le64 key_prp2;
+		};
+	};
+};
+
 struct nvme_kv_store_command {
 	__u8 opcode;
 	__u8 flags;
@@ -267,6 +291,7 @@ struct kv_batch_data {
 struct nvme_kv_command {
 	union {
 		struct nvme_common_command common;
+		struct nvme_kv_common_command kv_common;
 		struct nvme_kv_store_command kv_store;
 		struct nvme_kv_retrieve_command kv_retrieve;
 		struct nvme_kv_delete_command kv_delete;

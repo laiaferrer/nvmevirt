@@ -4,22 +4,97 @@
 #include <linux/highmem.h>
 #include <linux/sched/clock.h>
 #include <linux/fs.h>
+//#include <linux/base64.h> /* Not present in 5.10.35 */
 
 #include "nvmev.h"
 #include "kv_ftl.h"
 
-struct file *file_open(const char *path, int flags, int rights)
-{
-    struct file *filp = NULL;
-    mm_segment_t oldfs;
-    int err = 0;
+/**
+ * Code from Linux /lib/base64.c not present in 5.10.35
+ */
+static const char base64_table[65] =
+	"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-    filp = filp_open(path, flags, rights);
-    if (IS_ERR(filp)) {
-        err = PTR_ERR(filp);
-        return NULL;
-    }
-    return filp;
+/**
+ * base64_encode() - base64-encode some binary data
+ * @src: the binary data to encode
+ * @srclen: the length of @src in bytes
+ * @dst: (output) the base64-encoded string.  Not NUL-terminated.
+ *
+ * Encodes data using base64 encoding, i.e. the "Base 64 Encoding" specified
+ * by RFC 4648, including the  '='-padding.
+ *
+ * Return: the length of the resulting base64-encoded string in bytes.
+ */
+int base64_encode(const u8 *src, int srclen, char *dst)
+{
+	u32 ac = 0;
+	int bits = 0;
+	int i;
+	char *cp = dst;
+
+	for (i = 0; i < srclen; i++) {
+		ac = (ac << 8) | src[i];
+		bits += 8;
+		do {
+			bits -= 6;
+			*cp++ = base64_table[(ac >> bits) & 0x3f];
+		} while (bits >= 6);
+	}
+	if (bits) {
+		*cp++ = base64_table[(ac << (6 - bits)) & 0x3f];
+		bits -= 6;
+	}
+	while (bits < 0) {
+		*cp++ = '=';
+		bits += 2;
+	}
+	return cp - dst;
+}
+
+/**
+ * base64_decode() - base64-decode a string
+ * @src: the string to decode.  Doesn't need to be NUL-terminated.
+ * @srclen: the length of @src in bytes
+ * @dst: (output) the decoded binary data
+ *
+ * Decodes a string using base64 encoding, i.e. the "Base 64 Encoding"
+ * specified by RFC 4648, including the  '='-padding.
+ *
+ * This implementation hasn't been optimized for performance.
+ *
+ * Return: the length of the resulting decoded binary data in bytes,
+ *	   or -1 if the string isn't a valid base64 string.
+ */
+int base64_decode(const char *src, int srclen, u8 *dst)
+{
+	u32 ac = 0;
+	int bits = 0;
+	int i;
+	u8 *bp = dst;
+
+	for (i = 0; i < srclen; i++) {
+		const char *p = strchr(base64_table, src[i]);
+
+		if (src[i] == '=') {
+			ac = (ac << 6);
+			bits += 6;
+			if (bits >= 8)
+				bits -= 8;
+			continue;
+		}
+		if (p == NULL || src[i] == 0)
+			return -1;
+		ac = (ac << 6) | (p - base64_table);
+		bits += 6;
+		if (bits >= 8) {
+			bits -= 8;
+			*bp++ = (u8)(ac >> bits);
+		}
+	}
+	if (ac & ((1 << bits) - 1))
+		return -1;
+	return bp - dst;
 }
 
 static const struct allocator_ops append_only_ops = {
@@ -507,7 +582,47 @@ static struct mapping_entry delete_mapping_entry(struct kv_ftl *kv_ftl, struct n
 }
 
 /* 4 is for '/kv/', 16 is for the key and + 1 for the trailing 0 */
-#define KV_PATH_LEN (4+16+1)
+#define KV_BASE_PATH "/kv/"
+#define KV_BASE_PATH_LEN 4
+#define NVME_KV_MAX_KEY_LEN 16
+#define NVME_KV_MAX_PRINTABLE_KEY_LEN (NVME_KV_MAX_KEY_LEN*2)
+#define KV_PATH_LEN (KV_BASE_PATH_LEN+NVME_KV_MAX_PRINTABLE_KEY_LEN+1)
+
+static void delete_filp(struct file *filp)
+{
+	struct inode *parent_inode = filp->f_path.dentry->d_parent->d_inode;
+	NVMEV_INFO("Deleting file %s\n", filp->f_path.dentry->d_iname);
+	inode_lock(parent_inode);
+	vfs_unlink(parent_inode, filp->f_path.dentry, NULL);
+	inode_unlock(parent_inode);
+}
+
+static int delete_file(const char *path)
+{
+	struct file *filp;
+	struct inode *parent_inode;
+	filp = filp_open(path, O_RDWR, 0666);
+	if (IS_ERR(filp))
+		return PTR_ERR_OR_ZERO(filp);
+	parent_inode = filp->f_path.dentry->d_parent->d_inode;
+	NVMEV_INFO("Deleting file %s\n", filp->f_path.dentry->d_iname);
+	inode_lock(parent_inode);
+	vfs_unlink(parent_inode, filp->f_path.dentry, NULL);
+	inode_unlock(parent_inode);
+	filp_close(filp, NULL);
+	return 0;
+}
+
+static int file_exists(const char *path) {
+	struct file *filp;
+	filp = filp_open(path, O_RDONLY, 0666);
+	if (IS_ERR(filp))
+		return 0;
+	else {
+		filp_close(filp, NULL);
+		return 1;
+	}
+}
 
 /* KV-SSD IO */
 
@@ -535,19 +650,30 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 	struct mapping_entry entry;
 	int is_insert = 0;
 	int ret = 0;
-	struct file *kv_file;
+	struct file *kv_file = NULL;
 	char kv_path[KV_PATH_LEN];
+	char *path_key_ptr = kv_path + strlen(KV_BASE_PATH);
+	int no_offset = 0;
+
 	memset(kv_path, 0, KV_PATH_LEN);
-	sprintf(kv_path, "/kv/");
+	sprintf(kv_path, KV_BASE_PATH);
 
 	entry = get_mapping_entry(kv_ftl, cmd);
 	offset = entry.mem_offset;
 	length = cmd_value_length(cmd);
 
-	if (cmd.common.opcode == nvme_cmd_kv_store) {
-		strncpy(kv_path + 4, cmd.kv_store.key, KV_PATH_LEN - 4 - 1 /* always have trailing 0 */);
-		kv_file = filp_open(kv_path, O_RDWR | O_CREAT, 0666);
+	ret = base64_encode(cmd.kv_common.key, cmd.kv_common.key_len, path_key_ptr);
+	if (ret < 0) {
+		NVMEV_ERROR("Base64 conversion failed\n");
+		strcpy(path_key_ptr, "error");
+	} else if (ret > NVME_KV_MAX_PRINTABLE_KEY_LEN) {
+		NVMEV_ERROR("Base64 overwrite ! We wrote %d characters\n", ret);
+	}
 
+	NVMEV_INFO("Key: %s Key Base64: %s length: %d\n", cmd.kv_common.key, path_key_ptr, ret);
+
+	if (cmd.common.opcode == nvme_cmd_kv_store) {
+		kv_file = filp_open(kv_path, O_RDWR | O_CREAT, 0666);
 		if (entry.mem_offset == -1) { // entry doesn't exist -> is insert
 			new_offset = allocate_mem_offset(kv_ftl, cmd);
 			offset = new_offset;
@@ -556,7 +682,51 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 			NVMEV_DEBUG("kv_store insert %s %lu\n", cmd.kv_store.key, offset);
 		} else {
 			NVMEV_DEBUG("kv_store update %s %lu\n", cmd.kv_store.key, offset);
+#if 0 /* OFFSETS ARE NOT ALWAYS SET */
+			if (cmd.kv_store.option & 0x01) {
+				NVMEV_DEBUG("NO kv_store insert %s %lu because Bit 8 set to 1\n", cmd.kv_store.key, offset);		//controller shall not store the value if the key does not exist
+			}
+			else {
+				kv_file = filp_open(kv_path, O_RDWR | O_CREAT, 0666);
+				new_offset = allocate_mem_offset(kv_ftl, cmd);
+				offset = new_offset;
+				is_insert = 1; // is insert
+				NVMEV_DEBUG("kv_store insert %s %lu\n", cmd.kv_store.key, offset);
+			}
+		} else {
+			if (cmd.kv_store.option & 0x02) {
+				NVMEV_DEBUG("NO kv_store update %s %lu because Bit 9 set to 1\n", cmd.kv_store.key, offset);		//controller shall not store the value if the key does exist
+			}
+			else {
+				if (entry.mem_offset == -1) { // kv pair doesn't exist
+					NVMEV_DEBUG("kv_delete %s no exist\n", cmd.kv_store.key);
 
+					*status = KV_ERR_KEY_NOT_EXIST;
+					return 0; // dev_status_code for KVS_ERR_KEY_NOT_EXIST
+				} else {
+					NVMEV_DEBUG("kv_delete %s exist - length %ld, offset %lu\n",
+							cmd.kv_store.key, length, offset);
+
+					delete_file(kv_path);
+					delete_mapping_entry(kv_ftl, cmd);
+				}
+
+				//store of the KV
+				if (cmd.kv_store.option & 0x01) {
+					NVMEV_DEBUG("NO kv_store insert %s %lu because Bit 8 set to 1\n", cmd.kv_store.key, offset);		//controller shall not store the value if the key does not exist
+				}
+				else {
+					kv_file = filp_open(kv_path, O_RDWR | O_CREAT, 0666);
+					new_offset = allocate_mem_offset(kv_ftl, cmd);
+					offset = new_offset;
+					is_insert = 1; // is insert
+					NVMEV_DEBUG("kv_store insert %s %lu\n", cmd.kv_store.key, offset);
+				}
+
+				NVMEV_DEBUG("kv_store update %s %lu\n", cmd.kv_store.key, offset);
+			}
+
+#endif
 			if (length != entry.length) {
 				if (length <= SMALL_LENGTH && entry.length <= SMALL_LENGTH) {
 					is_insert = 2; // is update with different length;
@@ -566,6 +736,13 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 			}
 		}
 	} else if (cmd.common.opcode == nvme_cmd_kv_retrieve) {
+		kv_file = filp_open(kv_path, O_RDONLY, 0666);
+		if (IS_ERR(kv_file)) {
+			NVMEV_INFO("File %s does not exist\n", kv_path);
+			*status = KV_ERR_KEY_NOT_EXIST;
+			/*return 0; // dev_status_code for KVS_ERR_KEY_NOT_EXIST */
+		}
+
 		if (entry.mem_offset == -1) { // kv pair doesn't exist
 			NVMEV_DEBUG("kv_retrieve %s no exist\n", cmd.kv_store.key);
 
@@ -575,9 +752,15 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 			length = min(entry.length, length);
 
 			NVMEV_DEBUG("kv_retrieve %s exist - length %ld, offset %lu\n",
-				    cmd.kv_store.key, length, offset);
+					cmd.kv_store.key, length, offset);
 		}
 	} else if (cmd.common.opcode == nvme_cmd_kv_exist) {
+		if (!file_exists(kv_path)) {
+			NVMEV_INFO("Could not open file %s\n", kv_path);
+		} else {
+			NVMEV_INFO("File %s does exist\n", kv_path);
+		}
+
 		if (entry.mem_offset == -1) { // kv pair doesn't exist
 			NVMEV_DEBUG("kv_exist %s no exist\n", cmd.kv_store.key);
 
@@ -589,6 +772,31 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 			return 0;
 		}
 	} else if (cmd.common.opcode == nvme_cmd_kv_delete) {
+		if (!file_exists(kv_path)) {
+			NVMEV_INFO("Could not open file %s\n", kv_path);
+			*status = KV_ERR_KEY_NOT_EXIST;
+			/* return 0; */
+		} else {
+			NVMEV_INFO("File %s does exist, deleting...\n", kv_path);
+			delete_file(kv_path);
+			/* return 0; */
+		}
+#if 0
+		strncpy(kv_path + 4, key64, length_keyb64 - 4 - 1 /* always have trailing 0 */);
+		kv_file = filp_open(kv_path, O_RDONLY, 0666);
+
+		if (IS_ERR(kv_file)) {
+			NVMEV_INFO("Could not open file %s\n", kv_path);
+			*status = KV_ERR_KEY_NOT_EXIST;
+			return 0;
+		} else {
+			parent_inode = kv_file->f_path.dentry->d_parent->d_inode;
+			NVMEV_INFO("Deleting file %s\n", kv_path);
+			inode_lock(parent_inode);
+			vfs_unlink(parent_inode, kv_file->f_path.dentry, NULL);
+			inode_unlock(parent_inode);
+		}
+#endif
 		if (entry.mem_offset == -1) { // kv pair doesn't exist
 			NVMEV_DEBUG("kv_delete %s no exist\n", cmd.kv_store.key);
 
@@ -596,7 +804,7 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 			return 0; // dev_status_code for KVS_ERR_KEY_NOT_EXIST
 		} else {
 			NVMEV_DEBUG("kv_delete %s exist - length %ld, offset %lu\n",
-				    cmd.kv_store.key, length, offset);
+					cmd.kv_store.key, length, offset);
 
 			delete_mapping_entry(kv_ftl, cmd);
 			return 0;
@@ -639,18 +847,26 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 		}
 		if (cmd.common.opcode == nvme_cmd_kv_store) {
 			memcpy(nvmev_vdev->storage_mapped + offset, vaddr + mem_offs, io_size);
-			if (!kv_file) {
-				NVMEV_ERROR("Could not open test_file\n");
+			if (!kv_file || IS_ERR(kv_file)) {
+				NVMEV_ERROR("Could not write to file %s\n", kv_path);
 			} else {
-				NVMEV_INFO("Writing value: %s with size: %zu to file: %s\n", (char*)(vaddr + mem_offs), io_size, kv_path);
+				NVMEV_INFO("Writing data with size: %zu to file: %s\n", io_size, kv_path);
 				ret = kernel_write(kv_file, vaddr + mem_offs, io_size, &file_offset);
 				if (ret < 0) {
-					NVMEV_ERROR("Could not write KV to file\n");
+					NVMEV_ERROR("Could not write KV value to file %s\n", kv_path);
 				}
-				filp_close(kv_file, NULL);
 			}
 		} else if (cmd.common.opcode == nvme_cmd_kv_retrieve) {
 			memcpy(vaddr + mem_offs, nvmev_vdev->storage_mapped + offset, io_size);
+			if (!kv_file || IS_ERR(kv_file)) {
+				NVMEV_ERROR("Could not read file %s\n", kv_path);
+			} else {
+				NVMEV_INFO("Writing data with size: %zu to file: %s\n", io_size, kv_path);
+				ret = kernel_read(kv_file, vaddr + mem_offs, io_size, &file_offset);
+				if (ret < 0) {
+					NVMEV_ERROR("Could not read KV value from file %s\n", kv_path);
+				}
+			}
 		} else {
 			NVMEV_ERROR("Wrong KV Command passed to NVMeVirt!!\n");
 		}
@@ -660,6 +876,10 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 		remaining -= io_size;
 		offset += io_size;
 		file_offset += io_size;
+	}
+
+	if (kv_file && !IS_ERR(kv_file)) {
+		filp_close(kv_file, NULL);
 	}
 
 	if (paddr_list != NULL)
@@ -1016,8 +1236,8 @@ bool kv_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req, struct 
 		ret->nsecs_target = __schedule_flush(req);
 		break;
 	case nvme_cmd_kv_store:
-	/*case nvme_cmd_kv_delete:
-		ret->nsecs_target = __schedule_flush(req);*/
+	case nvme_cmd_kv_delete:
+		//ret->nsecs_target = __schedule_flush(req);
 	case nvme_cmd_kv_retrieve:
 	case nvme_cmd_kv_batch:
 	case nvme_cmd_kv_exist:
