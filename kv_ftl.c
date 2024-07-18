@@ -672,6 +672,7 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 
 	if (cmd.common.opcode == nvme_cmd_kv_store) {
 		if (!file_exists(kv_path)) { // entry doesn't exist -> is insert
+			/*TO DO: look if it is really an hexadecimal or is the value that in the KVSSD*/
 			if (cmd.kv_store.option & 0x01) {
 				NVMEV_DEBUG("NO kv_store insert %s %lu because Bit 8 set to 1\n", cmd.kv_store.key, offset);		//controller shall not store the value if the key does not exist
 				*status = KV_ERR_KEY_NOT_EXIST;
@@ -679,8 +680,8 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 			}
 			else {
 				kv_file = filp_open(kv_path, O_RDWR | O_CREAT, 0666);
-				new_offset = allocate_mem_offset(kv_ftl, cmd);
-				offset = new_offset;
+				//new_offset = allocate_mem_offset(kv_ftl, cmd);
+                //offset = new_offset;
 				is_insert = 1; // is insert
 				NVMEV_DEBUG("kv_store insert %s %lu\n", cmd.kv_store.key, offset);
 			}
@@ -698,8 +699,8 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 
 				//create and insert file
 				kv_file = filp_open(kv_path, O_RDWR | O_CREAT, 0666);
-				new_offset = allocate_mem_offset(kv_ftl, cmd);
-				offset = new_offset;
+				//new_offset = allocate_mem_offset(kv_ftl, cmd);
+                //offset = new_offset;
 				is_insert = 1; // is insert
 
 				NVMEV_DEBUG("kv_store update %s %lu\n", cmd.kv_store.key, offset);
