@@ -18,20 +18,26 @@
 #define is_kv_iter_read_cmd(opcode) ((opcode) == nvme_cmd_kv_iter_read)
 #define is_kv_exist_cmd(opcode) ((opcode) == nvme_cmd_kv_exist)
 #define is_kv_batch_cmd(opcode) ((opcode) == nvme_cmd_kv_batch)
+#define is_kv_list_cmd(opcode) ((opcode) == nvme_cmd_kv_list)
 
 #define is_kv_cmd(opcode)                                                                         \
 	(is_kv_append_cmd(opcode) || is_kv_store_cmd(opcode) || is_kv_retrieve_cmd(opcode) ||     \
 	 is_kv_delete_cmd(opcode) || is_kv_iter_req_cmd(opcode) || is_kv_iter_read_cmd(opcode) || \
 	 is_kv_exist_cmd(opcode)) ||                                                              \
-		is_kv_batch_cmd(opcode)
+		is_kv_batch_cmd(opcode) || is_kv_list_cmd(opcode)
 
 #define is_kv_iter_cmd(opcode) (is_kv_iter_req_cmd(opcode) || is_kv_iter_read_cmd(opcode))
 
 typedef enum {
 	// generic command status
 	KV_SUCCESS = 0, // success
-	KV_ERR_KEY_NOT_EXIST = 0x310,
-	KV_ERR_DEV_CAPACITY = 0x312,
+  KV_ERR_INVALID_VALUE_SIZE = 0x85,
+  KV_ERR_INVALID_KEY_SIZE = 0X86,
+  KV_ERR_INVALID_NAMESPACE_OR_FORMAT = 0x0B,
+  KV_ERR_CAPACITY_EXCEEDED = 0x81,
+  KV_ERR_KEY_EXISTS = 0x89,
+  KV_ERR_KEY_NOT_EXIST = 0x87,
+  KV_ERR_UNRECOVERED_ERROR = 0x88,
 
 #if 0
   // errors
@@ -113,22 +119,6 @@ typedef enum {
   KVS_ERR_CONT_OPEN=0x407	, // container is already opened
 #endif
 } kvs_result;
-
-static inline __le64 kv_io_cmd_key_prp(struct nvme_kv_command cmd, const int prp_num)
-{
-	if (prp_num != 1 && prp_num != 2) {
-		NVMEV_ERROR("Invalid PRP number %d in rw_cmd_prp", prp_num);
-		return 0;
-	}
-
-	if (prp_num == 1) {
-		return cmd.kv_store.key_prp;
-	} else {
-		return cmd.kv_store.key_prp2;
-	}
-
-	return 0;
-}
 
 static inline __le64 kv_io_cmd_value_prp(struct nvme_kv_command cmd, const int prp_num)
 {

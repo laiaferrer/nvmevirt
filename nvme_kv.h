@@ -20,54 +20,153 @@ union nvme_data_ptr {
 
 /*KV-SSD Command*/
 struct nvme_kv_common_command {
-	__u8 opcode;
-	__u8 flags;
-	__u16 command_id;
-	__le32 nsid;
-	__u64 rsvd;
-	__le32 offset;
-	__u32 rsvd2;
-	union nvme_data_ptr dptr; /* value dptr prp1,2 */
-	__le32 value_len; /* size in word */
-	__u8 key_len; /* 0 ~ 255 (keylen - 1) */
-	__u8 option;
-	__u16 rsvd3;
 	union {
+		__u32 cdw0;
 		struct {
-			char key[16];
+			__u8 opcode;
+			__u8 fuse : 2;
+			__u8 rsvd_cdw0 : 4;
+			__u8 psdt : 2;
+			__u16 cid;
 		};
-		struct {
-			__le64 key_prp;
-			__le64 key_prp2;
+	};
+	// cdw1
+	__u32 nsid;
+	// cdw2-3
+	union {
+		__u64 key_lsb;
+		struct 
+		{
+			__u32 key0;
+			__u32 key1;
+		};
+	};
+	// cdw4-5
+	__u64 mptr;				//metadata pointer cdw4 and cdw5
+	// cdw6-9
+	union nvme_data_ptr dptr;
+	// cdw10
+	__u32 value_size;			//value size
+	__u32 cdw11;
+	__u32 cdw12;			//reserved
+	__u32 cdw13;			//reserved
+	// cdw14-15
+	union {
+		__u64 key_msb;
+		struct 
+		{
+			__u32 key2;
+			__u32 key3;
 		};
 	};
 };
 
 struct nvme_kv_store_command {
-	__u8 opcode;
-	__u8 flags;
-	__u16 command_id;
-	__le32 nsid;
-	__u64 rsvd;
-	__le32 offset;
-	__u32 rsvd2;
-	union nvme_data_ptr dptr; /* value dptr prp1,2 */
-	__le32 value_len; /* size in word */
-	__u8 key_len; /* 0 ~ 255 (keylen - 1) */
-	__u8 option;
-	__u8 invalid_byte : 2;
-	__u8 rsvd3 : 6;
-	__u8 rsvd4;
 	union {
+		__u32 cdw0;
 		struct {
-			char key[16];
+			__u8 opcode;
+			__u8 fuse : 2;
+			__u8 rsvd_cdw0 : 4;
+			__u8 psdt : 2;
+			__u16 cid;
 		};
-		struct {
-			__le64 key_prp;
-			__le64 key_prp2;
+	};
+	// cdw1
+	__u32 nsid;
+	// cdw2-3
+	union {
+		__u64 key_lsb;
+		struct 
+		{
+			__u32 key0;
+			__u32 key1;
+		};
+	};
+	// cdw4-5
+	__u64 mptr;				//metadata pointer cdw4 and cdw5
+	// cdw6-9
+	union nvme_data_ptr dptr;
+	// cdw10
+	__u32 value_size;			//value size
+	// cdw11
+	union {
+		__u32 cdw11;
+		struct 
+		{
+			__u8 key_length;
+			__u8 bit8 : 1;
+			__u8 bit9 : 1;
+			__u8 bit10 : 1;
+			__u8 reserved1 : 5;
+			__u16 reserved2;
+		};
+	};
+	__u32 cdw12;			//reserved
+	__u32 cdw13;			//reserved
+	// cdw14-15
+	union {
+		__u64 key_msb;
+		struct 
+		{
+			__u32 key2;
+			__u32 key3;
 		};
 	};
 };
+
+struct nvme_kv_retrieve_command {
+	union {
+		__u32 cdw0;
+		struct {
+			__u8 opcode;
+			__u8 fuse : 2;
+			__u8 rsvd_cdw0 : 4;
+			__u8 psdt : 2;
+			__u16 cid;
+		};
+	};
+	// cdw1
+	__u32 nsid;
+	// cdw2-3
+	union {
+		__u64 key_lsb;
+		struct 
+		{
+			__u32 key0;
+			__u32 key1;
+		};
+	};
+	// cdw4-5
+	__u64 mptr;				//metadata pointer cdw4 and cdw5
+	// cdw6-9
+	union nvme_data_ptr dptr;
+	// cdw10
+	__u32 host_buffer_size;
+	// cdw11
+	union {
+		__u32 cdw11;
+		struct 
+		{
+			__u8 key_length;
+			__u8 bit8 : 1;
+			__u8 reserved1 : 7;
+			__u16 reserved2;
+		};
+	};
+	__u32 cdw12;			//reserved
+	__u32 cdw13;			//reserved
+	// cdw14-15
+	union {
+		__u64 key_msb;
+		struct 
+		{
+			__u32 key2;
+			__u32 key3;
+		};
+	};
+};
+
 
 struct nvme_kv_append_command {
 	__u8 opcode;
@@ -120,50 +219,52 @@ struct nvme_kv_batch_command {
 	};
 };
 
-struct nvme_kv_retrieve_command {
-	__u8 opcode;
-	__u8 flags;
-	__u16 command_id;
-	__le32 nsid;
-	__u64 rsvd;
-	__le32 offset;
-	__u32 rsvd2;
-	union nvme_data_ptr dptr; /* value dptr prp1,2 */
-	__le32 value_len; /* size in word */
-	__u8 key_len; /* 0 ~ 255 (keylen - 1) */
-	__u8 option;
-	__u16 rsvd3;
+struct nvme_kv_delete_command {
 	union {
+		__u32 cdw0;
 		struct {
-			char key[16];
-		};
-		struct {
-			__le64 key_prp;
-			__le64 key_prp2;
+			__u8 opcode;
+			__u8 fuse : 2;
+			__u8 rsvd_cdw0 : 4;
+			__u8 psdt : 2;
+			__u16 cid;
 		};
 	};
-};
-
-struct nvme_kv_delete_command {
-	__u8 opcode;
-	__u8 flags;
-	__u16 command_id;
-	__le32 nsid;
-	__u64 rsvd;
-	__le32 offset;
-	__u32 rsvd2;
-	__u64 rsvd3[2];
-	__le32 value_len; /* size in word */
-	__u8 key_len; /* 0 ~ 255 (keylen - 1) */
-	__u8 option;
-	__u16 rsvd4;
+	// cdw1
+	__u32 nsid;
+	// cdw2-3
 	union {
-		struct {
-			char key[16];
+		__u64 key_lsb;
+		struct 
+		{
+			__u32 key0;
+			__u32 key1;
 		};
-		struct {
-			__le64 key_prp;
-			__le64 key_prp2;
+	};
+	// cdw4-5
+	__u64 mptr;					//metadata pointer cdw4 and cdw5
+	// cdw6-9
+	union nvme_data_ptr dptr;	//data ptr
+	// cdw10
+	__u32 reserved1;
+	// cdw11
+	union {
+		__u32 cdw11;
+		struct 
+		{
+			__u8 key_length;
+			__u64 reserved2 : 24;
+		};
+	};
+	__u32 cdw12;			//reserved
+	__u32 cdw13;			//reserved
+	// cdw14-15
+	union {
+		__u64 key_msb;
+		struct 
+		{
+			__u32 key2;
+			__u32 key3;
 		};
 	};
 };
@@ -198,25 +299,101 @@ struct nvme_kv_iter_read_command {
 };
 
 struct nvme_kv_exist_command {
-	__u8 opcode;
-	__u8 flags;
-	__u16 command_id;
-	__le32 nsid;
-	__u64 rsvd;
-	__le32 offset;
-	__u32 rsvd2;
-	__u64 rsvd3[2];
-	__le32 value_len; /* size in word */
-	__u8 key_len; /* 0 ~ 255 (keylen - 1) */
-	__u8 option;
-	__u16 rsvd4;
 	union {
+		__u32 cdw0;
 		struct {
-			char key[16];
+			__u8 opcode;
+			__u8 fuse : 2;
+			__u8 rsvd_cdw0 : 4;
+			__u8 psdt : 2;
+			__u16 cid;
 		};
+	};
+	// cdw1
+	__u32 nsid;
+	// cdw2-3
+	union {
+		__u64 key_lsb;
+		struct 
+		{
+			__u32 key0;
+			__u32 key1;
+		};
+	};
+	// cdw4-5
+	__u64 mptr;					//metadata pointer cdw4 and cdw5
+	// cdw6-9
+	union nvme_data_ptr dptr;	//data ptr
+	// cdw10
+	__u32 reserved1;
+	// cdw11
+	union {
+		__u32 cdw11;
+		struct 
+		{
+			__u8 key_length;
+			__u64 reserved2 : 24;
+		};
+	};
+	__u32 cdw12;			//reserved
+	__u32 cdw13;			//reserved
+	// cdw14-15
+	union {
+		__u64 key_msb;
+		struct 
+		{
+			__u32 key2;
+			__u32 key3;
+		};
+	};
+};
+
+struct nvme_kv_list_command {
+	union {
+		__u32 cdw0;
 		struct {
-			__le64 key_prp;
-			__le64 key_prp2;
+			__u8 opcode;
+			__u8 fuse : 2;
+			__u8 rsvd_cdw0 : 4;
+			__u8 psdt : 2;
+			__u16 cid;
+		};
+	};
+	// cdw1
+	__u32 nsid;
+	// cdw2-3
+	union {
+		__u64 key_lsb;
+		struct 
+		{
+			__u32 key0;
+			__u32 key1;
+		};
+	};
+	// cdw4-5
+	__u64 mptr;					//metadata pointer cdw4 and cdw5
+	// cdw6-9
+	union nvme_data_ptr dptr;	//data ptr
+	// cdw10
+	__u32 host_buffer_size;		//in bytes
+	// cdw11
+	union {
+		__u32 cdw11;
+		struct 
+		{
+			__u8 key_length;
+			__u64 reserved2 : 24;
+		};
+	};
+	__u32 cdw12;			//reserved
+	__u32 cdw13;			//reserved
+	// cdw14-15
+	union {
+		__u64 key_msb;
+		struct 
+		{
+			__u32 key2;
+			__u32 key3;
 		};
 	};
 };
@@ -300,6 +477,7 @@ struct nvme_kv_command {
 		struct nvme_kv_iter_read_command kv_iter_read;
 		struct nvme_kv_exist_command kv_exist;
 		struct nvme_kv_batch_command kv_batch;
+		struct nvme_kv_list_command kv_list;
 	};
 };
 #endif
