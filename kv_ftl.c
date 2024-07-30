@@ -3,6 +3,7 @@
 #include <linux/ktime.h>
 #include <linux/highmem.h>
 #include <linux/sched/clock.h>
+#include <linux/namei.h>
 
 
 //#include <stdio.h> 
@@ -34,6 +35,7 @@ static const char base64_table[65] =
 static void bin_to_hex(const char *data, int length, char *output) {
 	int i;
 	//NVMEV_INFO("Length: %d\n", length);
+	
     for (i = 0; i < length; ++i) {
 		//NVMEV_INFO("KEY BINARI: %02x, char: %c\n", data[i] & 0xFF, data[i]);
         sprintf(output + (i * 2), "%02x", data[i] & 0xFF);
@@ -116,12 +118,12 @@ static unsigned long long __schedule_io_units(int opcode, unsigned long lba, uns
 	unsigned int latency = 0;
 	unsigned int trailing = 0;
 
-	if (opcode == nvme_cmd_write || opcode == nvme_cmd_kv_store ||
+	if (opcode == nvme_cmd_kv_store ||
 	    opcode == nvme_cmd_kv_batch) {
 		delay = nvmev_vdev->config.write_delay;
 		latency = nvmev_vdev->config.write_time;
 		trailing = nvmev_vdev->config.write_trailing;
-	} else if (opcode == nvme_cmd_read || opcode == nvme_cmd_kv_retrieve) {
+	} else if (opcode == nvme_cmd_kv_retrieve) {
 		delay = nvmev_vdev->config.read_delay;
 		latency = nvmev_vdev->config.read_time;
 		trailing = nvmev_vdev->config.read_trailing;
@@ -178,28 +180,127 @@ static void delete_filp(struct file *filp)
 	inode_unlock(parent_inode);
 }
 
+#if 1
 static int delete_file(const char *path)
 {
 	struct file *filp;
 	filp = filp_open(path, O_RDWR, 0666);
 	if (IS_ERR(filp))
 		return PTR_ERR_OR_ZERO(filp);
-	delete_filp(filp);
 	filp_close(filp, NULL);
+	delete_filp(filp);
 	return 0;
 }
+#else
+
+struct dentry *kern_path_locked(const char *name, struct path *path)
+{
+	struct filename *filename = getname_kernel(name);
+	struct dentry *res = __kern_path_locked(AT_FDCWD, filename, path);
+
+	putname(filename);
+	return res;
+}
+
+/* Code from https://elixir.bootlin.com/linux/v6.8/source/drivers/base/devtmpfs.c#L309 */
+//static int handle_remove(const char *nodename)
+static int delete_file(const char *nodename)
+{
+	struct path parent;
+	struct dentry *dentry;
+	int deleted = 0;
+	int err;
+
+	dentry = kern_path_locked(nodename, &parent);
+	if (IS_ERR(dentry))
+		return PTR_ERR(dentry);
+
+	if (d_really_is_positive(dentry)) {
+		struct kstat stat;
+		struct path p = {.mnt = parent.mnt, .dentry = dentry};
+		err = vfs_getattr(&p, &stat, STATX_TYPE | STATX_MODE,
+				  AT_STATX_SYNC_AS_STAT);
+		if (!err /*&& dev_mynode(dev, d_inode(dentry), &stat)*/) {
+			struct iattr newattrs;
+			/*
+			 * before unlinking this node, reset permissions
+			 * of possible references like hardlinks
+			 */
+			newattrs.ia_uid = GLOBAL_ROOT_UID;
+			newattrs.ia_gid = GLOBAL_ROOT_GID;
+			newattrs.ia_mode = stat.mode & ~0777;
+			newattrs.ia_valid =
+				ATTR_UID|ATTR_GID|ATTR_MODE;
+			inode_lock(d_inode(dentry));
+			notify_change(&nop_mnt_idmap, dentry, &newattrs, NULL);
+			inode_unlock(d_inode(dentry));
+			err = vfs_unlink(&nop_mnt_idmap, d_inode(parent.dentry),
+					 dentry, NULL);
+			if (!err || err == -ENOENT)
+				deleted = 1;
+		}
+	} else {
+		err = -ENOENT;
+	}
+	dput(dentry);
+	inode_unlock(d_inode(parent.dentry));
+
+	path_put(&parent);
+#if 0
+	if (deleted && strchr(nodename, '/'))
+		delete_path(nodename);
+#endif
+	return err;
+}
+#endif
 
 static int file_exists(const char *path) {
 	struct file *filp;
 	NVMEV_INFO("PATH: %s", path);
 	filp = filp_open(path, O_RDONLY, 0666);
 	if (IS_ERR(filp)) {
+		NVMEV_INFO("file_exists error code is: %ld\n", PTR_ERR(filp));
 		return 0;
 	}
 	else {
 		filp_close(filp, NULL);
 		return 1;
 	}
+}
+
+struct kv_readdir_data {
+	struct dir_context	ctx;
+	union {
+		void		*private;
+		char		*dirent;
+	};
+
+	unsigned int		used;
+	unsigned int		dirent_count;
+	unsigned int		file_attr;
+	void *buffer_of_keys;
+	size_t buffer_of_keys_len;
+	struct unicode_map	*um;
+};
+
+static bool __dir_print_actor(struct dir_context *ctx, const char *name, int namlen,
+		       loff_t offset, u64 ino, unsigned int d_type)
+{
+	struct kv_readdir_data *buf;
+
+	buf = container_of(ctx, struct kv_readdir_data, ctx);
+	buf->dirent_count++;
+	if (strcmp(name, ".")) NVMEV_INFO("ACTOR: Count: %d Name: %s\n", buf->dirent_count, name);
+
+	//return buf->dirent_count <= 2;
+	//return 1;
+	return strcmp(name, ".");
+}
+
+uint32_t swap_uint32( uint32_t val )
+{
+    val = ((val << 8) & 0xFF00FF00 ) | ((val >> 8) & 0xFF00FF ); 
+    return (val << 16) | (val >> 16);
 }
 
 /* KV-SSD IO */
@@ -226,7 +327,6 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 	size_t mem_offs = 0;
 	size_t new_offset = 0;
 
-	int is_insert = 0;
 	int ret = 0;
 	struct file *kv_file = NULL;
 	char kv_path[KV_PATH_LEN];
@@ -254,7 +354,10 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 		NVMEV_INFO("Key: %s %s Key binary: %#08llx %#08llx Key Hex: %s length: %d\n",
 				   (const char *)&cmd.kv_common.key_lsb, (const char *)&cmd.kv_common.key_msb,
 				   cmd.kv_common.key_lsb, cmd.kv_common.key_msb, path_key_ptr, cmd.kv_store.key_length);
-
+		cmd.kv_common.key0 = swap_uint32(cmd.kv_common.key0);
+		cmd.kv_common.key1 = swap_uint32(cmd.kv_common.key1);
+		cmd.kv_common.key2 = swap_uint32(cmd.kv_common.key2);
+		cmd.kv_common.key3 = swap_uint32(cmd.kv_common.key3);
 		bin_to_hex((const char*)&cmd.kv_common.key_lsb, min(cmd.kv_store.key_length, sizeof(cmd.kv_common.key_lsb)), path_key_ptr);
 		if (cmd.kv_store.key_length > sizeof(cmd.kv_common.key_lsb)) {
 			bin_to_hex((const char*)&cmd.kv_common.key_msb, cmd.kv_store.key_length - sizeof(cmd.kv_common.key_lsb), path_key_ptr + sizeof(cmd.kv_common.key_lsb)*2);
@@ -291,7 +394,6 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 			}
 			else {
 				kv_file = filp_open(kv_path, O_RDWR | O_CREAT, 0666);
-				is_insert = 1; // is insert
 				NVMEV_DEBUG("kv_store insert %s %lu\n", path_key_ptr, offset);
 			}
 		} else {
@@ -309,7 +411,6 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 				delete_file(kv_path);
 				//create and insert file
 				kv_file = filp_open(kv_path, O_RDWR | O_CREAT, 0666);
-				is_insert = 1; // is insert
 				NVMEV_DEBUG("kv_store update %s %lu\n", path_key_ptr, offset);
 			}
 		}
@@ -347,6 +448,7 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 			return 0;
 		}
 	} else if (cmd.common.opcode == nvme_cmd_kv_list) {
+		NVMEV_INFO("\t--- NVME KV LIST ---\n");
 		if(cmd.kv_retrieve.key_length > 16 || cmd.kv_store.key_length < 0) {
 			NVMEV_DEBUG("ERROR: key size is not valid");
 			*status = KV_ERR_INVALID_KEY_SIZE;
@@ -358,34 +460,34 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 			*status = KV_ERR_INVALID_NAMESPACE_OR_FORMAT;
 			return 0;
 		} else {
-			struct file *fp = (struct file *) NULL;
+			struct file *fp = NULL;
 			char *buf, *path;
-			char *hex_path ;
-			fp = filp_open("/kv/", O_DIRECTORY, S_IRUSR);
+			fp = filp_open("/kv", O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_DIRECTORY, 0);
 			if (fp == NULL) {
-				*status = KV_ERR_KEY_NOT_EXIST;
+				*status = KV_ERR_INVALID_NAMESPACE_OR_FORMAT;
 				NVMEV_INFO("ERROR opening the directory");
 				return 0;		
 			}
 			NVMEV_INFO("Directory successfully open");
 			buf = __getname();
 			if (!buf) {
-				*status = KV_ERR_CAPACITY_EXCEEDED;
+				*status = NVME_SC_INTERNAL;
+				filp_close(fp, NULL);
 				NVMEV_INFO("ERROR allocating memory");
 				return 0;
 			}
+			memset(buf, 0, PATH_MAX);
 			struct dentry *dentry;
-			hlist_for_each_entry(dentry, &fp->f_path.dentry->d_children, d_sib) {
-				path = dentry_path_raw(dentry, buf, PATH_MAX);
-				if (IS_ERR(path)) {
-					__putname(buf);
-					*status = KV_ERR_CAPACITY_EXCEEDED;
-					NVMEV_INFO("ERROR make the ls");
-					return 0;
-				}
-				NVMEV_INFO("PATH: %s\n", path);
-			}
+
+			struct dir_context ctx;
+			struct kv_readdir_data readdir_data;
+			memset(&readdir_data, 0, sizeof(struct kv_readdir_data));
+			readdir_data.ctx.actor = __dir_print_actor;
+			//readdir_data.buffer_of_keys = ...; /* buffer provide by host */
+			//readdir_data.buffer_of_keys_len = ...;
+			ret = iterate_dir(fp, &readdir_data.ctx);
 			__putname(buf);
+			filp_close(fp, NULL);
 			return 0;
 		}
 	} else {
@@ -520,15 +622,6 @@ bool kv_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req, struct 
 	struct nvme_command *cmd = req->cmd;
 
 	switch (cmd->common.opcode) {
-	case nvme_cmd_write:
-	case nvme_cmd_read:
-		ret->nsecs_target = __schedule_io_units(
-			cmd->common.opcode, cmd->rw.slba,
-			__cmd_io_size((struct nvme_rw_command *)cmd), __get_wallclock());
-		break;
-	case nvme_cmd_flush:
-		ret->nsecs_target = __schedule_flush(req);
-		break;
 	case nvme_cmd_kv_store:
 	case nvme_cmd_kv_delete:
 		//ret->nsecs_target = __schedule_flush(req);

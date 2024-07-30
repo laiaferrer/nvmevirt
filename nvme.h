@@ -305,28 +305,13 @@ struct nvme_reservation_status {
 /* I/O commands */
 
 #define NVME_OPCODES(op)			\
-	op(nvme_cmd_flush, 0x00)		\
-	op(nvme_cmd_write, 0x01)		\
-	op(nvme_cmd_read, 0x02)			\
-	op(nvme_cmd_write_uncor, 0x04)		\
-	op(nvme_cmd_compare, 0x05)		\
-	op(nvme_cmd_write_zeroes, 0x08)		\
-	op(nvme_cmd_dsm, 0x09)			\
-	op(nvme_cmd_verify, 0x0c)		\
-	op(nvme_cmd_resv_register, 0x0d)	\
-	op(nvme_cmd_resv_report, 0x0e)		\
-	op(nvme_cmd_resv_acquire, 0x11)		\
-	op(nvme_cmd_resv_release, 0x15)		\
-	op(nvme_cmd_zone_mgmt_send, 0x79)	\
-	op(nvme_cmd_zone_mgmt_recv, 0x7a)	\
-	op(nvme_cmd_zone_append, 0x7d) \
-	op(nvme_cmd_kv_store, 0x81) \
+	op(nvme_cmd_kv_store, 0x01) \
 	op(nvme_cmd_kv_append, 0x83) \
-	op(nvme_cmd_kv_retrieve, 0x90) \
-	op(nvme_cmd_kv_delete, 0xA1) \
+	op(nvme_cmd_kv_retrieve, 0x02) \
+	op(nvme_cmd_kv_delete, 0x10) \
 	op(nvme_cmd_kv_iter_req, 0xB1) \
 	op(nvme_cmd_kv_iter_read, 0xB2) \
-	op(nvme_cmd_kv_exist, 0xB3) \
+	op(nvme_cmd_kv_exist, 0x14) \
 	op(nvme_cmd_kv_batch, 0x85) \
 	op(nvme_cmd_kv_list, 0x06) \
 
