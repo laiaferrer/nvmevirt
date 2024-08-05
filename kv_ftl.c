@@ -4,7 +4,7 @@
 #include <linux/highmem.h>
 #include <linux/sched/clock.h>
 #include <linux/namei.h>
-
+#include <linux/slab.h>
 
 //#include <stdio.h> 
 //#include <dirent.h> 
@@ -32,7 +32,7 @@ static const char base64_table[65] =
  * Return: the length of the resulting base64-encoded string in bytes.
  */
 
-static void bin_to_hex(const char *data, int length, char *output) {
+static void __bin_to_hex(const char *data, int length, char *output) {
 	int i;
 	//NVMEV_INFO("Length: %d\n", length);
 	
@@ -43,6 +43,45 @@ static void bin_to_hex(const char *data, int length, char *output) {
     }
     output[length * 2] = '\0'; 
 	NVMEV_INFO("hex convert: %s\n", output);
+}
+
+static int __hex_to_bin(const char *input, int input_length, char *output, int output_length) {
+    // Ensure the input has an even number of characters
+    //NVMEV_INFO ("HOLA");
+	if (input_length == 0) {
+		NVMEV_INFO ("Length equals 0");
+        return 0;
+	}else if (input_length % 2 != 0) {
+		NVMEV_INFO ("Hexadecimal string must have an even number of characters.");
+        return 0;
+    }
+	
+    if (output_length < input_length / 2) {
+		NVMEV_INFO ("Output buffer is too small.");
+		return 0;
+    }
+
+    for (int i = 0; i < input_length; i += 2) {
+        char byteString[3] = {input[i], input[i + 1], '\0'};
+        long byteValue;
+        int ret = kstrtol(byteString, 16, &byteValue); // Pass the address of byteValue
+
+        if (ret) {
+            NVMEV_INFO("Conversion error: %d", ret);
+            return 0;
+        }
+
+        // Ensure the value fits within a byte
+        if (byteValue < 0 || byteValue > 255) {
+            NVMEV_INFO("Hexadecimal value out of range: %ld", byteValue);
+            return 0;
+        }
+
+        output[i / 2] = (char)byteValue;
+    }
+
+	//NVMEV_INFO("TO BINARY AGAIN: %s", output);
+	return 1;
 }
 
 static void DumpHex(const void* data, size_t size) {
@@ -259,6 +298,7 @@ static int file_exists(const char *path) {
 	NVMEV_INFO("PATH: %s", path);
 	filp = filp_open(path, O_RDONLY, 0666);
 	if (IS_ERR(filp)) {
+		NVMEV_INFO("File does not exist");
 		NVMEV_INFO("file_exists error code is: %ld\n", PTR_ERR(filp));
 		return 0;
 	}
@@ -268,39 +308,88 @@ static int file_exists(const char *path) {
 	}
 }
 
+struct kds {
+	__u16 key_length;
+	char key[16];
+	__u16 rsvd;
+} __packed;
+
 struct kv_readdir_data {
 	struct dir_context	ctx;
 	union {
 		void		*private;
 		char		*dirent;
 	};
-
+	char 				*kv_path;
+	unsigned int		found;
+	unsigned int		number_of_keys;
 	unsigned int		used;
 	unsigned int		dirent_count;
 	unsigned int		file_attr;
 	void *buffer_of_keys;
 	size_t buffer_of_keys_len;
+	size_t current_position;
+	size_t key_len;
 	struct unicode_map	*um;
 };
+
+static bool __dir_print_actor_not_exist(struct dir_context *ctx, const char *name, int namlen,
+		       loff_t offset, u64 ino, unsigned int d_type)
+{
+	struct kv_readdir_data *buf;
+	buf = container_of(ctx, struct kv_readdir_data, ctx);
+	buf->dirent_count++;
+	if (strcmp(name, ".") && strcmp(name, "..")) NVMEV_INFO("ACTOR: Count: %d Name: %s\n", buf->dirent_count, name);
+	return 1;
+	//return strcmp(name, ".");
+}
 
 static bool __dir_print_actor(struct dir_context *ctx, const char *name, int namlen,
 		       loff_t offset, u64 ino, unsigned int d_type)
 {
 	struct kv_readdir_data *buf;
+	struct kds kds;
 
 	buf = container_of(ctx, struct kv_readdir_data, ctx);
 	buf->dirent_count++;
-	if (strcmp(name, ".")) NVMEV_INFO("ACTOR: Count: %d Name: %s\n", buf->dirent_count, name);
+	if (!strcmp(name, buf->kv_path + 4))  {
+		buf->found = 1;
+	}
+	if (strlen(name) == 0) {
+		return 0;
+	}
+	int key_length = (int)strlen(name)/2;
+	//NVMEV_INFO("KEY NAME: %s", name);
 
-	//return buf->dirent_count <= 2;
-	//return 1;
-	return strcmp(name, ".");
-}
+	if (strcmp(name, ".") && strcmp(name, "..") && buf->found) {
+		kds.key_length = (unsigned int)key_length;
+		if (name != NULL) {
 
-uint32_t swap_uint32( uint32_t val )
-{
-    val = ((val << 8) & 0xFF00FF00 ) | ((val >> 8) & 0xFF00FF ); 
-    return (val << 16) | (val >> 16);
+			int ret = __hex_to_bin(name, (int)strlen(name), (void*)&kds.key, key_length);
+			//NVMEV_INFO("KEY BINARY: %s", kds.key);
+			++buf->number_of_keys;
+			if (ret == 0) {
+				NVMEV_INFO("ERROR doing the transformation from hexadecimal to binary");
+				return 0;
+			}
+		}
+
+		/* The Key data structure should be a multiple of 4 bytes (u32) so we add 3 (sizeof(u32)-1) and integer divide by sizeof(u32) to round up */
+		size_t kds_size = ((sizeof(kds.key_length) + kds.key_length + (sizeof(u32) - 1)) / sizeof(u32)) * sizeof(u32);
+
+		NVMEV_INFO("ACTOR: Count: %d Name: %s\n", buf->dirent_count, name);
+		if ((buf->current_position + kds_size) <= buf->buffer_of_keys_len) {
+			//NVMEV_INFO("KDS SIZE %zu\n", kds_size);
+			memcpy(buf->buffer_of_keys + buf->current_position, &kds, kds_size);
+			buf->current_position += kds_size;
+			return 1;
+		} else {
+			NVMEV_INFO("The key does not fit in the buffer");
+			return 0;
+		}
+		
+	}
+	return 1;
 }
 
 /* KV-SSD IO */
@@ -327,6 +416,10 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 	size_t mem_offs = 0;
 	size_t new_offset = 0;
 
+	struct dir_context ctx;
+	struct kv_readdir_data readdir_data;
+	memset(&readdir_data, 0, sizeof(struct kv_readdir_data));
+
 	int ret = 0;
 	struct file *kv_file = NULL;
 	char kv_path[KV_PATH_LEN];
@@ -342,6 +435,8 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 	//NVMEV_INFO("KEY ABANS DE HEX: %s\n", cmd.kv_common.key);
 	//NVMEV_INFO("PRIMER CARCATER DE LA KEY: %c\n", cmd.kv_common.key[3]);
 
+	NVMEV_INFO("KEY LENGTH: %u\n", cmd.kv_list.cdw11);
+
 	if ((cmd.common.opcode == nvme_cmd_kv_store) || 
 	    (cmd.common.opcode == nvme_cmd_kv_retrieve) ||
 		(cmd.common.opcode == nvme_cmd_kv_exist) ||
@@ -350,17 +445,22 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 	{
 		/* We use store as type here, but all the commands have the key_length at the same location */
 		//NVMEV_INFO("Key first: %d\n",cmd.kv_store.key_length);
-		//it will be something like this:
 		NVMEV_INFO("Key: %s %s Key binary: %#08llx %#08llx Key Hex: %s length: %d\n",
 				   (const char *)&cmd.kv_common.key_lsb, (const char *)&cmd.kv_common.key_msb,
 				   cmd.kv_common.key_lsb, cmd.kv_common.key_msb, path_key_ptr, cmd.kv_store.key_length);
-		cmd.kv_common.key0 = swap_uint32(cmd.kv_common.key0);
-		cmd.kv_common.key1 = swap_uint32(cmd.kv_common.key1);
-		cmd.kv_common.key2 = swap_uint32(cmd.kv_common.key2);
-		cmd.kv_common.key3 = swap_uint32(cmd.kv_common.key3);
-		bin_to_hex((const char*)&cmd.kv_common.key_lsb, min(cmd.kv_store.key_length, sizeof(cmd.kv_common.key_lsb)), path_key_ptr);
+		u64 key_start = (((u64)cpu_to_be32(le32_to_cpu(cmd.kv_common.key1))) << 32) | cpu_to_be32(le32_to_cpu(cmd.kv_common.key0));
+		u64 key_end = (((u64)cpu_to_be32(le32_to_cpu(cmd.kv_common.key3))) << 32) | cpu_to_be32(le32_to_cpu(cmd.kv_common.key2));
+		key_start = cmd.kv_common.key_lsb;
+		key_end = cmd.kv_common.key_msb;
+		//cmd.kv_common.key0 = swap_endianness_uint32(cmd.kv_common.key0);
+		//cmd.kv_common.key1 = swap_endianness_uint32(cmd.kv_common.key1);
+		//cmd.kv_common.key2 = swap_endianness_uint32(cmd.kv_common.key2);
+		//cmd.kv_common.key3 = swap_endianness_uint32(cmd.kv_common.key3);
+		//__bin_to_hex((const char*)&cmd.kv_common.key_lsb, min(cmd.kv_store.key_length, sizeof(cmd.kv_common.key_lsb)), path_key_ptr);
+		__bin_to_hex((const char*)&key_start, min(cmd.kv_store.key_length, sizeof(cmd.kv_common.key_lsb)), path_key_ptr);
 		if (cmd.kv_store.key_length > sizeof(cmd.kv_common.key_lsb)) {
-			bin_to_hex((const char*)&cmd.kv_common.key_msb, cmd.kv_store.key_length - sizeof(cmd.kv_common.key_lsb), path_key_ptr + sizeof(cmd.kv_common.key_lsb)*2);
+			//__bin_to_hex((const char*)&cmd.kv_common.key_msb, cmd.kv_store.key_length - sizeof(cmd.kv_common.key_lsb), path_key_ptr + sizeof(cmd.kv_common.key_lsb)*2);
+			__bin_to_hex((const char*)&key_end, cmd.kv_store.key_length - sizeof(cmd.kv_common.key_lsb), path_key_ptr + sizeof(cmd.kv_common.key_lsb)*2);
 		}
 
 		NVMEV_INFO("Key path: %s\n", kv_path);
@@ -377,49 +477,51 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 			   (const char *)&cmd.kv_common.key_lsb, (const char *)&cmd.kv_common.key_msb, cmd.kv_common.key_lsb, cmd.kv_common.key_msb, path_key_ptr, ret);
 
 	NVMEV_INFO("OPCODE: %u\n", cmd.common.opcode);
-
+	NVMEV_INFO("KEY LENGTH: %u\n", cmd.kv_list.cdw11);
 	if (cmd.common.opcode == nvme_cmd_kv_store) {
-		if(cmd.kv_store.key_length > 16 || cmd.kv_store.key_length < 0) {
+		if(cmd.kv_store.key_length > 16 || cmd.kv_store.key_length <= 0) {
 			NVMEV_DEBUG("ERROR: key size is not valid");
 			*status = KV_ERR_INVALID_KEY_SIZE;
 			return 0;
 		}
-		NVMEV_INFO("DOES FILE EXIST %d\n",file_exists(kv_path));
-		if (!file_exists(kv_path)) { // entry doesn't exist -> is insert
-			NVMEV_INFO("INFO: OPTION = %#x\n", cmd.kv_store.cdw11);
-			if (cmd.kv_store.bit8) {
-				NVMEV_DEBUG("NO kv_store insert %s %lu because Bit 8 set to 1\n", path_key_ptr, offset);		//controller shall not store the value if the key does not exist
-				*status = KV_ERR_KEY_NOT_EXIST;
-				return 0;
-			}
-			else {
-				kv_file = filp_open(kv_path, O_RDWR | O_CREAT, 0666);
-				NVMEV_DEBUG("kv_store insert %s %lu\n", path_key_ptr, offset);
-			}
-		} else {
-			//update
-			NVMEV_INFO("INFO: OPTION = %#0x\n", cmd.kv_store.cdw11);
-			NVMEV_INFO("IS AN UPDATE");
-			if (cmd.kv_store.bit9) {
-				NVMEV_DEBUG("NO kv_store update %s %lu because Bit 9 set to 1\n", path_key_ptr, offset);		//controller shall not store the value if the key does exist
-				*status = KV_ERR_KEY_EXISTS;
-				return 0;
-			}
-			else {
-				NVMEV_DEBUG("kv_delete %s exist - length %ld, offset %lu\n",
-							path_key_ptr, length, offset);
-				delete_file(kv_path);
-				//create and insert file
-				kv_file = filp_open(kv_path, O_RDWR | O_CREAT, 0666);
-				NVMEV_DEBUG("kv_store update %s %lu\n", path_key_ptr, offset);
+		else {
+			NVMEV_INFO("DOES FILE EXIST %d\n",file_exists(kv_path));
+			if (!file_exists(kv_path)) { // entry doesn't exist -> is insert
+				NVMEV_INFO("INFO: OPTION = %#x\n", cmd.kv_store.cdw11);
+				if (cmd.kv_store.bit8) {
+					NVMEV_DEBUG("NO kv_store insert %s %lu because Bit 8 set to 1\n", path_key_ptr, offset);		//controller shall not store the value if the key does not exist
+					*status = KV_ERR_KEY_NOT_EXIST;
+					return 0;
+				}
+				else {
+					kv_file = filp_open(kv_path, O_RDWR | O_CREAT, 0666);
+					NVMEV_DEBUG("kv_store insert %s %lu\n", path_key_ptr, offset);
+				}
+			} else {
+				//update
+				NVMEV_INFO("INFO: OPTION = %#0x\n", cmd.kv_store.cdw11);
+				NVMEV_INFO("IS AN UPDATE");
+				if (cmd.kv_store.bit9) {
+					NVMEV_DEBUG("NO kv_store update %s %lu because Bit 9 set to 1\n", path_key_ptr, offset);		//controller shall not store the value if the key does exist
+					*status = KV_ERR_KEY_EXISTS;
+					return 0;
+				}
+				else {
+					NVMEV_DEBUG("kv_delete %s exist - length %ld, offset %lu\n",
+								path_key_ptr, length, offset);
+					delete_file(kv_path);
+					//create and insert file
+					kv_file = filp_open(kv_path, O_RDWR | O_CREAT, 0666);
+					NVMEV_DEBUG("kv_store update %s %lu\n", path_key_ptr, offset);
+				}
 			}
 		}
 	} else if (cmd.common.opcode == nvme_cmd_kv_retrieve) {
-		if(cmd.kv_retrieve.key_length > 16 || cmd.kv_store.key_length < 0) {
+		if(cmd.kv_retrieve.key_length > 16 || cmd.kv_retrieve.key_length <= 0) {
 			NVMEV_DEBUG("ERROR: key size is not valid");
 			*status = KV_ERR_INVALID_KEY_SIZE;
 			return 0;
-		}
+		} 
 		kv_file = filp_open(kv_path, O_RDONLY, 0666);
 		if (IS_ERR(kv_file)) {
 			NVMEV_INFO("File %s does not exist\n", kv_path);
@@ -427,7 +529,11 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 			return 0;
 		}
 	} else if (cmd.common.opcode == nvme_cmd_kv_exist) {
-		if (!file_exists(kv_path)) {
+		if(cmd.kv_exist.key_length > 16 || cmd.kv_exist.key_length <= 0) {
+			NVMEV_DEBUG("ERROR: key size is not valid");
+			*status = KV_ERR_INVALID_KEY_SIZE;
+			return 0;
+		} else if (!file_exists(kv_path)) {
 			NVMEV_INFO("Could not open file %s\n", kv_path);
 			NVMEV_INFO("File %s does NOT exist\n", kv_path);
 			*status = KV_ERR_KEY_NOT_EXIST;
@@ -437,7 +543,11 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 			return 0;
 		}
 	} else if (cmd.common.opcode == nvme_cmd_kv_delete) {
-		if (!file_exists(kv_path)) {
+		if(cmd.kv_delete.key_length > 16 || cmd.kv_delete.key_length <= 0) {
+			NVMEV_DEBUG("ERROR: key size is not valid");
+			*status = KV_ERR_INVALID_KEY_SIZE;
+			return 0;
+		} else if (!file_exists(kv_path)) {
 			NVMEV_INFO("Could not open file %s\n", kv_path);
 			NVMEV_INFO("File %s does NOT exist\n", kv_path);
 			*status = KV_ERR_KEY_NOT_EXIST;
@@ -449,47 +559,54 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 		}
 	} else if (cmd.common.opcode == nvme_cmd_kv_list) {
 		NVMEV_INFO("\t--- NVME KV LIST ---\n");
-		if(cmd.kv_retrieve.key_length > 16 || cmd.kv_store.key_length < 0) {
+		if(cmd.kv_list.key_length > 16 || cmd.kv_list.key_length <= 0) {
 			NVMEV_DEBUG("ERROR: key size is not valid");
 			*status = KV_ERR_INVALID_KEY_SIZE;
 			return 0;
 		}
-		if (!file_exists(kv_path)) {
-			NVMEV_INFO("Could not open file %s\n", kv_path);
-			NVMEV_INFO("File %s does NOT exist\n", kv_path);
+		struct file *fp = NULL;
+		char *buf, *path;
+		fp = filp_open("/kv", O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_DIRECTORY, 0);
+		if (fp == NULL) {
 			*status = KV_ERR_INVALID_NAMESPACE_OR_FORMAT;
-			return 0;
-		} else {
-			struct file *fp = NULL;
-			char *buf, *path;
-			fp = filp_open("/kv", O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_DIRECTORY, 0);
-			if (fp == NULL) {
-				*status = KV_ERR_INVALID_NAMESPACE_OR_FORMAT;
-				NVMEV_INFO("ERROR opening the directory");
-				return 0;		
-			}
-			NVMEV_INFO("Directory successfully open");
-			buf = __getname();
-			if (!buf) {
-				*status = NVME_SC_INTERNAL;
-				filp_close(fp, NULL);
-				NVMEV_INFO("ERROR allocating memory");
-				return 0;
-			}
-			memset(buf, 0, PATH_MAX);
-			struct dentry *dentry;
+			NVMEV_INFO("ERROR opening the directory");
+			return 0;		
+		}
+		NVMEV_INFO("Directory successfully open");
 
-			struct dir_context ctx;
-			struct kv_readdir_data readdir_data;
-			memset(&readdir_data, 0, sizeof(struct kv_readdir_data));
-			readdir_data.ctx.actor = __dir_print_actor;
-			//readdir_data.buffer_of_keys = ...; /* buffer provide by host */
-			//readdir_data.buffer_of_keys_len = ...;
-			ret = iterate_dir(fp, &readdir_data.ctx);
-			__putname(buf);
+		buf = __getname();
+		if (!buf) {
+			*status = NVME_SC_INTERNAL;
 			filp_close(fp, NULL);
+			NVMEV_INFO("ERROR allocating memory");
 			return 0;
 		}
+		memset(buf, 0, PATH_MAX);
+
+		path = kv_path;
+		readdir_data.kv_path = path;
+		readdir_data.found = 0;
+		NVMEV_INFO("KEY LENGTH1: %d", cmd.kv_list.key_length);
+		readdir_data.buffer_of_keys_len = cmd.kv_list.host_buffer_size;
+		readdir_data.key_len = cmd.kv_list.key_length;
+		readdir_data.current_position = 4;
+		readdir_data.number_of_keys = 0;
+		readdir_data.buffer_of_keys = kmalloc(readdir_data.buffer_of_keys_len, GFP_KERNEL);
+		if (!readdir_data.buffer_of_keys) {
+			NVMEV_INFO("ERROR allocating memory");
+			return 0;
+		}
+		memset(readdir_data.buffer_of_keys, 0, readdir_data.buffer_of_keys_len);
+		if (!file_exists(kv_path)) {
+			readdir_data.ctx.actor = __dir_print_actor_not_exist;
+		} else {
+			readdir_data.ctx.actor = __dir_print_actor;
+		}
+		ret = iterate_dir(fp, &readdir_data.ctx);
+		memcpy(readdir_data.buffer_of_keys, &readdir_data.number_of_keys, 4);
+		__putname(buf);
+		filp_close(fp, NULL);
+		//return 0;
 	} else {
 		NVMEV_ERROR("Cmd type %d, for a key but not store or retrieve. return 0\n",
 			    cmd.common.opcode);
@@ -548,6 +665,8 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 					NVMEV_ERROR("Could not read KV value from file %s\n", kv_path);
 				}
 			}
+		} else if (cmd.common.opcode == nvme_cmd_kv_list) {
+			memcpy(vaddr + mem_offs, readdir_data.buffer_of_keys + offset, io_size);
 		} else {
 			NVMEV_ERROR("Wrong KV Command passed to NVMeVirt!!\n");
 		}
@@ -564,6 +683,9 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 
 	if (paddr_list != NULL)
 		kunmap_atomic(paddr_list);
+
+	if (readdir_data.buffer_of_keys)
+		kfree(readdir_data.buffer_of_keys);
 
 	if (cmd.common.opcode == nvme_cmd_kv_retrieve)
 		return length;

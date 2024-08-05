@@ -187,5 +187,5 @@ void kv_init_namespace(struct nvmev_ns *ns, uint32_t id, uint64_t size, void *ma
 		       uint32_t cpu_nr_dispatcher);
 void kv_remove_namespace(struct nvmev_ns *ns);
 __u32 convert_char_to_u32(const char *data) ;
-uint32_t swap_uint32( uint32_t val );
+uint32_t swap_endianness_uint32( uint32_t val );
 #endif
