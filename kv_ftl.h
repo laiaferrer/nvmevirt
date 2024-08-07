@@ -38,6 +38,7 @@ typedef enum {
   KV_ERR_KEY_EXISTS = 0x89,
   KV_ERR_KEY_NOT_EXIST = 0x87,
   KV_ERR_UNRECOVERED_ERROR = 0x88,
+  KV_ERR_INVALID_BUFFER_SIZE = 0X89,
 
 #if 0
   // errors
