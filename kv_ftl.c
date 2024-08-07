@@ -4,6 +4,8 @@
 #include <linux/sched/clock.h>
 #include <linux/namei.h>
 #include <linux/slab.h>
+#include <linux/statfs.h>
+#include <linux/vfs.h>
 
 
 //#include <stdio.h> 
@@ -207,6 +209,8 @@ static unsigned long long __schedule_flush(struct nvmev_request *req)
 #define NVME_KV_MAX_KEY_LEN 16
 #define NVME_KV_MAX_PRINTABLE_KEY_LEN (NVME_KV_MAX_KEY_LEN*2)
 #define KV_PATH_LEN (KV_BASE_PATH_LEN+NVME_KV_MAX_PRINTABLE_KEY_LEN+1)
+#define MAX_NUM_VALUE_SIZE 2147483647
+#define DISK_SPACE 1				//in GB
 
 static void delete_filp(struct file *filp)
 {
@@ -367,9 +371,10 @@ static bool __dir_print_actor(struct dir_context *ctx, const char *name, int nam
 		/* The Key data structure should be a multiple of 4 bytes (u32) so we add 3 (sizeof(u32)-1) and integer divide by sizeof(u32) to round up */
 		size_t kds_size = ((sizeof(kds.key_length) + kds.key_length + (sizeof(u32) - 1)) / sizeof(u32)) * sizeof(u32);
 
-		NVMEV_INFO("ACTOR: Count: %d Name: %s\n", buf->dirent_count, name);
+		
 		if ((buf->current_position + kds_size) <= buf->buffer_of_keys_len) {
 			//NVMEV_INFO("KDS SIZE %zu\n", kds_size);
+			NVMEV_INFO("ACTOR: Count: %d Name: %s\n", buf->dirent_count, name);
 			memcpy(buf->buffer_of_keys + buf->current_position, &kds, kds_size);
 			buf->current_position += kds_size;
 			return 1;
@@ -478,6 +483,10 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 	NVMEV_INFO("KEY LENGTH: %u\n", cmd.kv_store.key_length);
 	if (cmd.common.opcode == nvme_cmd_kv_store) {
 
+		if(cmd.kv_store.value_size < 0 || cmd.kv_store.value_size > MAX_NUM_VALUE_SIZE) {
+			*status = KV_ERR_INVALID_VALUE_SIZE;
+			return 0;
+		}
 
 		NVMEV_INFO("DOES FILE EXIST %d\n",file_exists(kv_path));
 		if (file_exists(kv_path)) { // entry doesn't exist -> is insert
@@ -511,7 +520,7 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 		}
 		
 	} else if (cmd.common.opcode == nvme_cmd_kv_retrieve) {
-		if(cmd.kv_retrieve.host_buffer_size <= 0) {
+		if(cmd.kv_retrieve.host_buffer_size <= 0 || cmd.kv_retrieve.host_buffer_size > MAX_NUM_VALUE_SIZE) {
 			*status = KV_ERR_INVALID_BUFFER_SIZE;
 			return 0;
 		}
@@ -543,6 +552,10 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 			return 0;
 		}
 	} else if (cmd.common.opcode == nvme_cmd_kv_list) {
+		if(cmd.kv_list.host_buffer_size <= 0 || cmd.kv_list.host_buffer_size  > MAX_NUM_VALUE_SIZE) {
+			*status = KV_ERR_INVALID_BUFFER_SIZE;
+			return 0;
+		}
 		NVMEV_INFO("\t--- NVME KV LIST ---\n");
 		struct file *fp = NULL;
 		char *buf, *path;
@@ -595,7 +608,8 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 	}
 
 	remaining = length;
-	NVMEV_INFO("REMAINING: %zu\n", remaining);	
+	int counter = 0;
+	//NVMEV_INFO("REMAINING: %zu\n", remaining);	
 	while (remaining) {	
 		size_t io_size;
 		void *vaddr;
@@ -638,7 +652,8 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 			} else {
 				NVMEV_INFO("Reading data with size: %zu to file: %s\n", io_size, kv_path);
 				ret = kernel_read(kv_file, vaddr + mem_offs, io_size, &file_offset);
-				*status += io_size;
+				counter += ret;
+				//*status += io_size;
 				if (ret < 0) {
 					NVMEV_ERROR("Could not read KV value from file %s\n", kv_path);
 				}
@@ -668,10 +683,20 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 		kfree(readdir_data.buffer_of_keys);
 
 	if (cmd.common.opcode == nvme_cmd_kv_retrieve) {
-		NVMEV_INFO("HOLA\n");
-		NVMEV_INFO("length: %zu\n", length);
-		//*status = length;
-		return length;
+		if(ret == 0) {
+			*status = counter;
+			return counter;
+		}
+		else {
+			char temporal_buffer[500];
+			NVMEV_INFO("STILL REMAINIG DATA");
+			while(ret != 0) {
+				ret = kernel_read(kv_file, temporal_buffer, 500, &file_offset);
+				counter += ret;
+			}
+			*status = counter;
+			return counter;
+		}
 	}
 
 	return 0;
