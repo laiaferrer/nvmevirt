@@ -210,7 +210,7 @@ static unsigned long long __schedule_flush(struct nvmev_request *req)
 #define NVME_KV_MAX_PRINTABLE_KEY_LEN (NVME_KV_MAX_KEY_LEN*2)
 #define KV_PATH_LEN (KV_BASE_PATH_LEN+NVME_KV_MAX_PRINTABLE_KEY_LEN+1)
 #define MAX_NUM_VALUE_SIZE 2147483647
-#define DISK_SPACE 1				//in GB
+#define DISK_SPACE 1 * 4096			//in Bytes
 
 static void delete_filp(struct file *filp)
 {
@@ -297,13 +297,13 @@ static int delete_file(const char *nodename)
 }
 #endif
 
-static int file_exists(const char *path) {
+static int file_doesnt_exist(const char *path) {
 	struct file *filp;
 	NVMEV_INFO("PATH: %s", path);
 	filp = filp_open(path, O_RDONLY, 0666);
 	if (IS_ERR(filp)) {
 		NVMEV_INFO("File does not exist");
-		NVMEV_INFO("file_exists error code is: %ld\n", PTR_ERR(filp));
+		NVMEV_INFO("file_doesnt_exist error code is: %ld\n", PTR_ERR(filp));
 		return 1;
 	}
 	else {
@@ -311,6 +311,8 @@ static int file_exists(const char *path) {
 		return 0;
 	}
 }
+
+int actual_size;
 
 struct kds {
 	__u16 key_length;
@@ -482,14 +484,18 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 	NVMEV_INFO("OPCODE: %u\n", cmd.common.opcode);
 	NVMEV_INFO("KEY LENGTH: %u\n", cmd.kv_store.key_length);
 	if (cmd.common.opcode == nvme_cmd_kv_store) {
+		if (cmd.kv_store.value_size > actual_size) {
+			*status = KV_ERR_CAPACITY_EXCEEDED;
+			return 0;
+		}
 
 		if(cmd.kv_store.value_size < 0 || cmd.kv_store.value_size > MAX_NUM_VALUE_SIZE) {
 			*status = KV_ERR_INVALID_VALUE_SIZE;
 			return 0;
 		}
 
-		NVMEV_INFO("DOES FILE EXIST %d\n",file_exists(kv_path));
-		if (file_exists(kv_path)) { // entry doesn't exist -> is insert
+		NVMEV_INFO("DOES FILE EXIST %d\n",file_doesnt_exist(kv_path));
+		if (file_doesnt_exist(kv_path)) { // entry doesn't exist -> is insert
 			NVMEV_INFO("INFO: OPTION = %#x\n", cmd.kv_store.cdw11);
 			if (cmd.kv_store.bit8) {
 				NVMEV_DEBUG("NO kv_store insert %s %lu because Bit 8 set to 1\n", path_key_ptr, offset);		//controller shall not store the value if the key does not exist
@@ -531,7 +537,7 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 			return 0;
 		}
 	} else if (cmd.common.opcode == nvme_cmd_kv_exist) {
-		 if (file_exists(kv_path)) {
+		 if (file_doesnt_exist(kv_path)) {
 			NVMEV_INFO("Could not open file %s\n", kv_path);
 			NVMEV_INFO("File %s does NOT exist\n", kv_path);
 			*status = KV_ERR_KEY_NOT_EXIST;
@@ -541,13 +547,20 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 			return 0;
 		}
 	} else if (cmd.common.opcode == nvme_cmd_kv_delete) {
-		if (file_exists(kv_path)) {
+		if (file_doesnt_exist(kv_path)) {
 			NVMEV_INFO("Could not open file %s\n", kv_path);
 			NVMEV_INFO("File %s does NOT exist\n", kv_path);
 			*status = KV_ERR_KEY_NOT_EXIST;
 			return 0;
 		} else {
 			NVMEV_INFO("File %s does exist, deleting...\n", kv_path);
+			char temporal_buffer[500];
+			int value_size = 0;
+			while(ret != 0) {
+				ret = kernel_read(kv_file, temporal_buffer, 500, &file_offset);
+				value_size += ret;
+			}
+			actual_size += value_size;
 			delete_file(kv_path);
 			return 0;
 		}
@@ -590,7 +603,7 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 			return 0;
 		}
 		memset(readdir_data.buffer_of_keys, 0, readdir_data.buffer_of_keys_len);
-		if (file_exists(kv_path)) {
+		if (file_doesnt_exist(kv_path)) {
 			readdir_data.found = 1;
 			//readdir_data.ctx.actor = __dir_print_actor_not_exist;
 		} 
@@ -681,6 +694,11 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 
 	if (readdir_data.buffer_of_keys)
 		kfree(readdir_data.buffer_of_keys);
+	
+	if (cmd.common.opcode == nvme_cmd_kv_store) {
+		actual_size -= cmd.kv_store.value_size;
+	}
+
 
 	if (cmd.common.opcode == nvme_cmd_kv_retrieve) {
 		if(ret == 0) {
@@ -849,11 +867,32 @@ void kv_init_namespace(struct nvmev_ns *ns, uint32_t id, uint64_t size, void *ma
 	ns->identify_io_cmd = kv_identify_nvme_io_cmd;
 	ns->perform_io_cmd = kv_perform_nvme_io_cmd;
 
+	if(file_doesnt_exist("/kv_metadata/a")) {
+		//file doesn't exist actual size is disk space
+		actual_size = DISK_SPACE;
+	}else {
+		struct file *kv_file = NULL;
+		char buffer[sizeof(int)];
+		kv_file = filp_open("/kv_metadata/a", O_RDWR, 0666);
+		int ret = kernel_read(kv_file, buffer, sizeof(int), 0);
+		if (ret != 0) {
+			actual_size = *(int *)buffer;
+		}else {
+			actual_size = DISK_SPACE;
+		}
+	}
+
 	return;
 }
 
 void kv_remove_namespace(struct nvmev_ns *ns)
 {
+	struct file *kv_file = NULL;
+	char buffer[sizeof(int)];
+	memcpy(buffer, &actual_size, sizeof(int));
+	//file where the actual size will be saved
+	kv_file = filp_open("/kv_metadata/a", O_RDWR | O_CREAT, 0666);
+	int ret = kernel_write(kv_file, buffer, sizeof(int), 0);
 	kfree(ns->ftls);
 	ns->ftls = NULL;
 }
