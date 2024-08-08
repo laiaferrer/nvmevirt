@@ -7,9 +7,6 @@
 #include <linux/statfs.h>
 #include <linux/vfs.h>
 
-
-//#include <stdio.h> 
-//#include <dirent.h> 
 #include <linux/fs.h>
 //#include <linux/base64.h> /* Not present in 5.10.35 */
 
@@ -49,7 +46,6 @@ static void __bin_to_hex(const char *data, int length, char *output) {
 
 static int __hex_to_bin(const char *input, int input_length, char *output, int output_length) {
     // Ensure the input has an even number of characters
-    //NVMEV_INFO ("HOLA");
 	if (input_length == 0) {
 		NVMEV_INFO ("Length equals 0");
         return 0;
@@ -82,7 +78,6 @@ static int __hex_to_bin(const char *input, int input_length, char *output, int o
         output[i / 2] = (char)byteValue;
     }
 
-	//NVMEV_INFO("TO BINARY AGAIN: %s", output);
 	return 1;
 }
 
@@ -212,6 +207,8 @@ static unsigned long long __schedule_flush(struct nvmev_request *req)
 #define MAX_NUM_VALUE_SIZE 2147483647
 #define DISK_SPACE 1 * 4096			//in Bytes
 
+int actual_size;
+
 static void delete_filp(struct file *filp)
 {
 	struct dentry *dentry = filp->f_path.dentry;
@@ -223,7 +220,7 @@ static void delete_filp(struct file *filp)
 	inode_unlock(parent_inode);
 }
 
-#if 1
+
 static int delete_file(const char *path)
 {
 	struct file *filp;
@@ -234,68 +231,6 @@ static int delete_file(const char *path)
 	delete_filp(filp);
 	return 0;
 }
-#else
-
-struct dentry *kern_path_locked(const char *name, struct path *path)
-{
-	struct filename *filename = getname_kernel(name);
-	struct dentry *res = __kern_path_locked(AT_FDCWD, filename, path);
-
-	putname(filename);
-	return res;
-}
-
-/* Code from https://elixir.bootlin.com/linux/v6.8/source/drivers/base/devtmpfs.c#L309 */
-//static int handle_remove(const char *nodename)
-static int delete_file(const char *nodename)
-{
-	struct path parent;
-	struct dentry *dentry;
-	int deleted = 0;
-	int err;
-
-	dentry = kern_path_locked(nodename, &parent);
-	if (IS_ERR(dentry))
-		return PTR_ERR(dentry);
-
-	if (d_really_is_positive(dentry)) {
-		struct kstat stat;
-		struct path p = {.mnt = parent.mnt, .dentry = dentry};
-		err = vfs_getattr(&p, &stat, STATX_TYPE | STATX_MODE,
-				  AT_STATX_SYNC_AS_STAT);
-		if (!err /*&& dev_mynode(dev, d_inode(dentry), &stat)*/) {
-			struct iattr newattrs;
-			/*
-			 * before unlinking this node, reset permissions
-			 * of possible references like hardlinks
-			 */
-			newattrs.ia_uid = GLOBAL_ROOT_UID;
-			newattrs.ia_gid = GLOBAL_ROOT_GID;
-			newattrs.ia_mode = stat.mode & ~0777;
-			newattrs.ia_valid =
-				ATTR_UID|ATTR_GID|ATTR_MODE;
-			inode_lock(d_inode(dentry));
-			notify_change(&nop_mnt_idmap, dentry, &newattrs, NULL);
-			inode_unlock(d_inode(dentry));
-			err = vfs_unlink(&nop_mnt_idmap, d_inode(parent.dentry),
-					 dentry, NULL);
-			if (!err || err == -ENOENT)
-				deleted = 1;
-		}
-	} else {
-		err = -ENOENT;
-	}
-	dput(dentry);
-	inode_unlock(d_inode(parent.dentry));
-
-	path_put(&parent);
-#if 0
-	if (deleted && strchr(nodename, '/'))
-		delete_path(nodename);
-#endif
-	return err;
-}
-#endif
 
 static int file_doesnt_exist(const char *path) {
 	struct file *filp;
@@ -312,7 +247,6 @@ static int file_doesnt_exist(const char *path) {
 	}
 }
 
-int actual_size;
 
 struct kds {
 	__u16 key_length;
@@ -355,14 +289,12 @@ static bool __dir_print_actor(struct dir_context *ctx, const char *name, int nam
 		return 0;
 	}
 	int key_length = (int)strlen(name)/2;
-	//NVMEV_INFO("KEY NAME: %s", name);
 
 	if (strcmp(name, ".") && strcmp(name, "..") && buf->found) {
 		kds.key_length = (unsigned int)key_length;
 		if (name != NULL) {
 
 			int ret = __hex_to_bin(name, (int)strlen(name), (void*)&kds.key, key_length);
-			//NVMEV_INFO("KEY BINARY: %s", kds.key);
 			++buf->number_of_keys;
 			if (ret == 0) {
 				NVMEV_INFO("ERROR doing the transformation from hexadecimal to binary");
@@ -375,7 +307,6 @@ static bool __dir_print_actor(struct dir_context *ctx, const char *name, int nam
 
 		
 		if ((buf->current_position + kds_size) <= buf->buffer_of_keys_len) {
-			//NVMEV_INFO("KDS SIZE %zu\n", kds_size);
 			NVMEV_INFO("ACTOR: Count: %d Name: %s\n", buf->dirent_count, name);
 			memcpy(buf->buffer_of_keys + buf->current_position, &kds, kds_size);
 			buf->current_position += kds_size;
@@ -428,14 +359,7 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 	sprintf(kv_path, KV_BASE_PATH);
 
 	length = cmd_value_length(&cmd);
-	//NVMEV_INFO("LENGTH: %zu\n", length);	
-
-	//ret = base64_encode(cmd.kv_common.key, cmd.kv_common.key_len, path_key_ptr);
-	//NVMEV_INFO("KEY ABANS DE HEX: %s\n", cmd.kv_common.key);
-	//NVMEV_INFO("PRIMER CARCATER DE LA KEY: %c\n", cmd.kv_common.key[3]);
-
-	//NVMEV_INFO("KEY LENGTH: %u\n", cmd.kv_list.cdw11);
-
+	
 	if(cmd.kv_delete.key_length > 16 || cmd.kv_delete.key_length <= 0) {
 			NVMEV_DEBUG("ERROR: key size is not valid");
 			*status = KV_ERR_INVALID_KEY_SIZE;
@@ -449,7 +373,6 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 		(cmd.common.opcode == nvme_cmd_kv_list))
 	{
 		/* We use store as type here, but all the commands have the key_length at the same location */
-		//NVMEV_INFO("Key first: %d\n",cmd.kv_store.key_length);
 		NVMEV_INFO("Key: %s %s Key binary: %#08llx %#08llx Key Hex: %s length: %d\n",
 				   (const char *)&cmd.kv_common.key_lsb, (const char *)&cmd.kv_common.key_msb,
 				   cmd.kv_common.key_lsb, cmd.kv_common.key_msb, path_key_ptr, cmd.kv_store.key_length);
@@ -457,17 +380,10 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 		u64 key_end = (((u64)cpu_to_be32(le32_to_cpu(cmd.kv_common.key3))) << 32) | cpu_to_be32(le32_to_cpu(cmd.kv_common.key2));
 		key_start = cmd.kv_common.key_lsb;
 		key_end = cmd.kv_common.key_msb;
-		//cmd.kv_common.key0 = swap_endianness_uint32(cmd.kv_common.key0);
-		//cmd.kv_common.key1 = swap_endianness_uint32(cmd.kv_common.key1);
-		//cmd.kv_common.key2 = swap_endianness_uint32(cmd.kv_common.key2);
-		//cmd.kv_common.key3 = swap_endianness_uint32(cmd.kv_common.key3);
-		//__bin_to_hex((const char*)&cmd.kv_common.key_lsb, min(cmd.kv_store.key_length, sizeof(cmd.kv_common.key_lsb)), path_key_ptr);
 		__bin_to_hex((const char*)&key_start, min(cmd.kv_store.key_length, sizeof(cmd.kv_common.key_lsb)), path_key_ptr);
 		if (cmd.kv_store.key_length > sizeof(cmd.kv_common.key_lsb)) {
-			//__bin_to_hex((const char*)&cmd.kv_common.key_msb, cmd.kv_store.key_length - sizeof(cmd.kv_common.key_lsb), path_key_ptr + sizeof(cmd.kv_common.key_lsb)*2);
 			__bin_to_hex((const char*)&key_end, cmd.kv_store.key_length - sizeof(cmd.kv_common.key_lsb), path_key_ptr + sizeof(cmd.kv_common.key_lsb)*2);
 		}
-
 		NVMEV_INFO("Key path: %s\n", kv_path);
 	}
 
@@ -605,24 +521,20 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 		memset(readdir_data.buffer_of_keys, 0, readdir_data.buffer_of_keys_len);
 		if (file_doesnt_exist(kv_path)) {
 			readdir_data.found = 1;
-			//readdir_data.ctx.actor = __dir_print_actor_not_exist;
 		} 
 		readdir_data.ctx.actor = __dir_print_actor;
 		ret = iterate_dir(fp, &readdir_data.ctx);
 		memcpy(readdir_data.buffer_of_keys, &readdir_data.number_of_keys, sizeof(u32));
 		__putname(buf);
 		filp_close(fp, NULL);
-		//return 0;
 	} else {
 		NVMEV_ERROR("Cmd type %d, for a key but not store or retrieve. return 0\n",
 			    cmd.common.opcode);
-		/*TO DO: program an error bc 0 is success*/
 		return 0;
 	}
 
 	remaining = length;
-	int counter = 0;
-	//NVMEV_INFO("REMAINING: %zu\n", remaining);	
+	int counter = 0;	
 	while (remaining) {	
 		size_t io_size;
 		void *vaddr;
@@ -666,14 +578,11 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 				NVMEV_INFO("Reading data with size: %zu to file: %s\n", io_size, kv_path);
 				ret = kernel_read(kv_file, vaddr + mem_offs, io_size, &file_offset);
 				counter += ret;
-				//*status += io_size;
 				if (ret < 0) {
 					NVMEV_ERROR("Could not read KV value from file %s\n", kv_path);
 				}
 			}
 		} else if (cmd.common.opcode == nvme_cmd_kv_list) {
-			/*NVMEV_INFO("Vaddr: %#010llx, mem_offs: %zu, buffer: %#010llx, offset: %zu, io_size: %zu\n",
-						(u64)vaddr, mem_offs, (u64)readdir_data.buffer_of_keys, offset, io_size);*/
 			memcpy(vaddr + mem_offs, readdir_data.buffer_of_keys + offset, io_size);
 		} else {
 			NVMEV_ERROR("Wrong KV Command passed to NVMeVirt!!\n");
@@ -699,7 +608,6 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 		actual_size -= cmd.kv_store.value_size;
 	}
 
-
 	if (cmd.common.opcode == nvme_cmd_kv_retrieve) {
 		if(ret == 0) {
 			*status = counter;
@@ -716,53 +624,6 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 			return counter;
 		}
 	}
-
-	return 0;
-}
-
-static unsigned int __do_perform_kv_batched_io(struct kv_ftl *kv_ftl, int opcode, char *key,
-					       int key_len, char *value, int val_len)
-{
-	NVMEV_ERROR("__do_perform_kv_batched_io CODE WAS REMOVED\n");
-
-	return 0;
-}
-
-static unsigned int __do_perform_kv_batch(struct kv_ftl *kv_ftl, struct nvme_kv_command cmd,
-					  unsigned int *status)
-{
-	NVMEV_ERROR("__do_perform_kv_batch CODE WAS REMOVED\n");
-
-	return 0;
-}
-
-static unsigned int kv_iter_open(struct kv_ftl *kv_ftl, struct nvme_kv_command cmd, unsigned int *status)
-{
-	NVMEV_ERROR("kv_iter_open CODE WAS REMOVED\n");
-
-	return 0;
-}
-
-static unsigned int kv_iter_close(struct kv_ftl *kv_ftl, struct nvme_kv_command cmd, unsigned int *status)
-{
-	NVMEV_ERROR("kv_iter_close() CODE WAS REMOVED\n");
-
-	return 0;
-}
-
-static unsigned int kv_iter_read(struct kv_ftl *kv_ftl, struct nvme_kv_command cmd,
-				 unsigned int *status)
-{
-	NVMEV_ERROR("kv_iter_read() CODE WAS REMOVED\n");
-
-	return 0;
-}
-
-static unsigned int __do_perform_kv_iter_io(struct kv_ftl *kv_ftl, struct nvme_kv_command cmd,
-					    unsigned int *status)
-{
-	NVMEV_ERROR("__do_perform_kv_iter_io() CODE WAS REMOVED\n");
-
 	return 0;
 }
 
@@ -804,9 +665,9 @@ unsigned int kv_perform_nvme_io_cmd(struct nvmev_ns *ns, struct nvme_command *cm
 	struct nvme_kv_command *kv_cmd = (struct nvme_kv_command *)cmd;
 
 	if (is_kv_batch_cmd(cmd->common.opcode))
-		return __do_perform_kv_batch(kv_ftl, *kv_cmd, status);
+		return 0;
 	else if (is_kv_iter_cmd(cmd->common.opcode))
-		return __do_perform_kv_iter_io(kv_ftl, *kv_cmd, status);
+		return 0;
 	else
 		return __do_perform_kv_io(kv_ftl, *kv_cmd, status);
 }
