@@ -13,6 +13,8 @@
 #include "nvmev.h"
 #include "kv_ftl.h"
 
+#define DISK_ACTUAL_SIZE_PATH "/kv_metadata/actual_size"
+
 /**
  * Code from Linux /lib/base64.c not present in 5.10.35
  */
@@ -205,9 +207,10 @@ static unsigned long long __schedule_flush(struct nvmev_request *req)
 #define NVME_KV_MAX_PRINTABLE_KEY_LEN (NVME_KV_MAX_KEY_LEN*2)
 #define KV_PATH_LEN (KV_BASE_PATH_LEN+NVME_KV_MAX_PRINTABLE_KEY_LEN+1)
 #define MAX_NUM_VALUE_SIZE 2147483647
-#define DISK_SPACE 1 * 4096			//in Bytes
+#define DISK_SPACE 1024
 
-int actual_size;
+size_t actual_size;
+int is_insert;
 
 static void delete_filp(struct file *filp)
 {
@@ -354,6 +357,7 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 	char kv_path[KV_PATH_LEN];
 	char *path_key_ptr = kv_path + strlen(KV_BASE_PATH);
 	int no_offset = 0;
+	is_insert = 0;
 
 	memset(kv_path, 0, KV_PATH_LEN);
 	sprintf(kv_path, KV_BASE_PATH);
@@ -400,11 +404,6 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 	NVMEV_INFO("OPCODE: %u\n", cmd.common.opcode);
 	NVMEV_INFO("KEY LENGTH: %u\n", cmd.kv_store.key_length);
 	if (cmd.common.opcode == nvme_cmd_kv_store) {
-		if (cmd.kv_store.value_size > actual_size) {
-			*status = KV_ERR_CAPACITY_EXCEEDED;
-			return 0;
-		}
-
 		if(cmd.kv_store.value_size < 0 || cmd.kv_store.value_size > MAX_NUM_VALUE_SIZE) {
 			*status = KV_ERR_INVALID_VALUE_SIZE;
 			return 0;
@@ -412,6 +411,10 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 
 		NVMEV_INFO("DOES FILE EXIST %d\n",file_doesnt_exist(kv_path));
 		if (file_doesnt_exist(kv_path)) { // entry doesn't exist -> is insert
+			if (cmd.kv_store.value_size > actual_size) {
+				*status = KV_ERR_CAPACITY_EXCEEDED;
+				return 0;
+			}
 			NVMEV_INFO("INFO: OPTION = %#x\n", cmd.kv_store.cdw11);
 			if (cmd.kv_store.bit8) {
 				NVMEV_DEBUG("NO kv_store insert %s %lu because Bit 8 set to 1\n", path_key_ptr, offset);		//controller shall not store the value if the key does not exist
@@ -419,6 +422,7 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 				return 0;
 			}
 			else {
+				is_insert = 1;
 				kv_file = filp_open(kv_path, O_RDWR | O_CREAT, 0666);
 				NVMEV_DEBUG("kv_store insert %s %lu\n", path_key_ptr, offset);
 			}
@@ -434,6 +438,25 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 			else {
 				NVMEV_DEBUG("kv_delete %s exist - length %ld, offset %lu\n",
 							path_key_ptr, length, offset);
+							char temporal_buffer[500];
+				int value_size = 0;
+				ret = 1;
+				loff_t of = 0;
+				NVMEV_INFO("HOLA");
+				NVMEV_INFO("ACTUAL SIZE RN: %zu\n", actual_size);
+				NVMEV_INFO("ADEU");
+				kv_file = filp_open(kv_path, O_RDWR | O_CREAT, 0666);
+				while(ret != 0) {
+					ret = kernel_read(kv_file, temporal_buffer, 500, &of);
+					value_size += ret;
+				}
+				NVMEV_INFO("ACTUAL SIZE MODIFIED: value_length = %d\n", value_size);
+				actual_size += value_size;
+				if (cmd.kv_store.value_size > actual_size) {
+					actual_size -= value_size;
+					*status = KV_ERR_CAPACITY_EXCEEDED;
+					return 0;
+				}
 				delete_file(kv_path);
 				//create and insert file
 				kv_file = filp_open(kv_path, O_RDWR | O_CREAT, 0666);
@@ -472,11 +495,15 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 			NVMEV_INFO("File %s does exist, deleting...\n", kv_path);
 			char temporal_buffer[500];
 			int value_size = 0;
+			ret = 1;
 			while(ret != 0) {
 				ret = kernel_read(kv_file, temporal_buffer, 500, &file_offset);
 				value_size += ret;
 			}
+			NVMEV_INFO("ACTUAL SIZE MODIFIED: key_length = %d value_length = %d\n", cmd.kv_exist.key_length, value_size);
+			actual_size += cmd.kv_exist.key_length;
 			actual_size += value_size;
+			NVMEV_INFO("ACTUAL SIZE: %zu\n", actual_size);
 			delete_file(kv_path);
 			return 0;
 		}
@@ -605,7 +632,14 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 		kfree(readdir_data.buffer_of_keys);
 	
 	if (cmd.common.opcode == nvme_cmd_kv_store) {
+		if (is_insert) {
+			NVMEV_INFO("ACTUAL SIZE MODIFIED: key_length = %d value_length = %d\n", cmd.kv_store.key_length, cmd.kv_store.value_size);
+			actual_size -= cmd.kv_store.key_length;
+			is_insert = 0;
+		}
+		NVMEV_INFO("ACTUAL SIZE MODIFIED: value_length = %d\n", cmd.kv_store.value_size);
 		actual_size -= cmd.kv_store.value_size;
+		NVMEV_INFO("ACTUAL SIZE RN: %zu\n", actual_size);
 	}
 
 	if (cmd.common.opcode == nvme_cmd_kv_retrieve) {
@@ -728,32 +762,33 @@ void kv_init_namespace(struct nvmev_ns *ns, uint32_t id, uint64_t size, void *ma
 	ns->identify_io_cmd = kv_identify_nvme_io_cmd;
 	ns->perform_io_cmd = kv_perform_nvme_io_cmd;
 
-	if(file_doesnt_exist("/kv_metadata/a")) {
+	if (file_doesnt_exist(DISK_ACTUAL_SIZE_PATH)) {
 		//file doesn't exist actual size is disk space
 		actual_size = DISK_SPACE;
-	}else {
+	} else {
 		struct file *kv_file = NULL;
-		char buffer[sizeof(int)];
-		kv_file = filp_open("/kv_metadata/a", O_RDWR, 0666);
-		int ret = kernel_read(kv_file, buffer, sizeof(int), 0);
-		if (ret != 0) {
-			actual_size = *(int *)buffer;
-		}else {
+		kv_file = filp_open(DISK_ACTUAL_SIZE_PATH, O_RDWR, 0666);
+		int ret = kernel_read(kv_file, &actual_size, sizeof(actual_size), 0);
+		if (ret < sizeof(actual_size)) {
 			actual_size = DISK_SPACE;
 		}
+		NVMEV_INFO("KV: Actual size : %zu\n", actual_size);
+		filp_close(kv_file, NULL);
 	}
-
 	return;
 }
 
 void kv_remove_namespace(struct nvmev_ns *ns)
-{
+{	
 	struct file *kv_file = NULL;
-	char buffer[sizeof(int)];
-	memcpy(buffer, &actual_size, sizeof(int));
+	NVMEV_INFO("ACTUAL SIZE %zu\n", actual_size);
 	//file where the actual size will be saved
-	kv_file = filp_open("/kv_metadata/a", O_RDWR | O_CREAT, 0666);
-	int ret = kernel_write(kv_file, buffer, sizeof(int), 0);
+	kv_file = filp_open(DISK_ACTUAL_SIZE_PATH, O_RDWR | O_CREAT, 0666);
+	int ret = kernel_write(kv_file, &actual_size, sizeof(actual_size), 0);
+	size_t y;
+	ret = kernel_read(kv_file, &y, sizeof(actual_size), 0);
+	NVMEV_INFO("READ: %zu\n", y);
+	filp_close(kv_file, NULL);
 	kfree(ns->ftls);
 	ns->ftls = NULL;
 }
